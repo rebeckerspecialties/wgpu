@@ -1,6 +1,6 @@
 #[cfg(feature = "trace")]
 use alloc::string::ToString as _;
-use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
 use core::{
     iter,
     mem::{self, ManuallyDrop},
@@ -26,7 +26,7 @@ use crate::{
         CommandAllocator, CommandBuffer, CommandEncoder, CommandEncoderError, CopySide,
         TransferError,
     },
-    device::{DeviceError, WaitIdleError},
+    device::{DeviceError, QueueDescriptor, WaitIdleError},
     get_lowest_common_denom, hal_label,
     init_tracker::{has_copy_partial_init_tracker_coverage, TextureInitRange},
     lock::{rank, Mutex, MutexGuard, RwLock, RwLockWriteGuard},
@@ -42,7 +42,7 @@ use crate::{
     scratch::ScratchBuffer,
     snatch::{SnatchGuard, Snatchable},
     track::{self, Tracker, TrackerIndex},
-    FastHashMap, SubmissionIndex,
+    FastHashMap, LabelHelpers, SubmissionIndex,
 };
 use crate::{device::resource::CommandIndices, resource::RawResourceAccess};
 
@@ -50,6 +50,7 @@ pub struct Queue {
     raw: Box<dyn hal::DynQueue>,
     pub(crate) pending_writes: Mutex<PendingWrites>,
     life_tracker: Mutex<LifetimeTracker>,
+    label: String,
     // The device needs to be dropped last (`Device.zero_buffer` might be referenced by the encoder in pending writes).
     pub(crate) device: Arc<Device>,
 }
@@ -58,6 +59,7 @@ impl Queue {
     pub(crate) fn new(
         device: Arc<Device>,
         raw: Box<dyn hal::DynQueue>,
+        desc: QueueDescriptor,
         instance_flags: wgt::InstanceFlags,
     ) -> Result<Self, DeviceError> {
         let pending_encoder = device
@@ -103,6 +105,7 @@ impl Queue {
         Ok(Queue {
             raw,
             device,
+            label: desc.label.to_string(),
             pending_writes: Mutex::new(rank::QUEUE_PENDING_WRITES, pending_writes),
             life_tracker: Mutex::new(rank::QUEUE_LIFE_TRACKER, LifetimeTracker::new()),
         })
@@ -153,6 +156,7 @@ impl Queue {
                     mip_range: 0..1,
                     layer_range: 0..1,
                 },
+                None,
                 encoder,
                 &mut trackers.textures,
                 &device.alignments,
@@ -262,12 +266,7 @@ impl Queue {
 }
 
 crate::impl_resource_type!(Queue);
-// TODO: https://github.com/gfx-rs/wgpu/issues/4014
-impl Labeled for Queue {
-    fn label(&self) -> &str {
-        ""
-    }
-}
+crate::impl_labeled!(Queue);
 crate::impl_parent_device!(Queue);
 crate::impl_storage_item!(Queue);
 
@@ -721,7 +720,7 @@ impl<'a> PendingSubmission<'a> {
 //TODO: move out common parts of write_xxx.
 
 impl Queue {
-    pub fn write_buffer(
+    pub(crate) fn write_buffer_inner(
         &self,
         buffer: Arc<Buffer>,
         buffer_offset: wgt::BufferAddress,
@@ -789,6 +788,18 @@ impl Queue {
         pending_writes.consume(staging_buffer);
 
         result
+    }
+
+    pub fn write_buffer(
+        &self,
+        buffer: Arc<Buffer>,
+        buffer_offset: wgt::BufferAddress,
+        data: &[u8],
+    ) {
+        if let Err(error) = self.write_buffer_inner(buffer, buffer_offset, data) {
+            self.device
+                .handle_error(error, Some(self.label()), "Queue::write_buffer");
+        }
     }
 
     pub fn create_staging_buffer(
@@ -952,7 +963,7 @@ impl Queue {
         Ok(())
     }
 
-    pub fn write_texture(
+    pub fn write_texture_inner(
         &self,
         destination: wgt::TexelCopyTextureInfo<Arc<Texture>>,
         data: &[u8],
@@ -1079,6 +1090,7 @@ impl Queue {
                         mip_range: destination.mip_level..(destination.mip_level + 1),
                         layer_range,
                     },
+                    None,
                     encoder,
                     &mut trackers.textures,
                     &self.device.alignments,
@@ -1203,6 +1215,19 @@ impl Queue {
         Ok(())
     }
 
+    pub fn write_texture(
+        &self,
+        destination: wgt::TexelCopyTextureInfo<Arc<Texture>>,
+        data: &[u8],
+        data_layout: &wgt::TexelCopyBufferLayout,
+        size: &wgt::Extent3d,
+    ) {
+        if let Err(error) = self.write_texture_inner(destination, data, data_layout, size) {
+            self.device
+                .handle_error(error, Some(self.label()), "Queue::write_texture");
+        }
+    }
+
     #[cfg(webgl)]
     pub fn copy_external_image_to_texture(
         &self,
@@ -1217,7 +1242,9 @@ impl Queue {
         self.device.check_is_valid()?;
 
         let mut needs_flag = false;
-        needs_flag |= matches!(source.source, wgt::ExternalImageSource::OffscreenCanvas(_));
+        // `OffscreenCanvas` needs no downlevel flag: WebGL2's `texSubImage2D`
+        // accepts it as a `TexImageSource` and the gles backend uploads it the
+        // same way as `HTMLCanvasElement`.
         needs_flag |= source.origin != wgt::Origin2d::ZERO;
         needs_flag |= destination.color_space != wgt::PredefinedColorSpace::Srgb;
         #[allow(clippy::bool_comparison)]
@@ -1354,6 +1381,7 @@ impl Queue {
                         mip_range: destination.mip_level..(destination.mip_level + 1),
                         layer_range,
                     },
+                    None,
                     encoder,
                     &mut trackers.textures,
                     &self.device.alignments,
@@ -1468,7 +1496,7 @@ impl Queue {
         &self,
         submit_index: SubmissionIndex,
         commands: Option<Vec<crate::command::Command<crate::command::PointerReferences>>>,
-        error: alloc::string::String,
+        error: String,
     ) {
         if let Some(ref mut trace) = *self.device.trace.lock() {
             trace.add(Action::FailedCommands {
@@ -1479,7 +1507,7 @@ impl Queue {
         }
     }
 
-    pub fn submit(
+    fn submit_inner(
         &self,
         command_buffers: &[Arc<CommandBuffer>],
     ) -> Result<SubmissionIndex, (SubmissionIndex, QueueSubmitError)> {
@@ -1597,7 +1625,7 @@ impl Queue {
                 // this stage:
                 //  - `hal` command encoding errors. These produce device loss in
                 //    `handle_hal_error`, independent of what we do here.
-                //  - Errors from `initialize_texture_memory`. The error cases that
+                //  - Errors from texture initialization. The error cases that
                 //    can actually occur should also be encoder errors, but we map
                 //    everything to device loss, just in case.
                 lose_device_on_error = true;
@@ -1618,15 +1646,18 @@ impl Queue {
 
                     baked.initialize_buffer_memory(&mut trackers, &submission.snatch_guard);
 
-                    if let Err(e) = baked.initialize_texture_memory(
+                    let depth_slice_discards = match baked.initialize_texture_memory(
                         &mut trackers,
                         &self.device,
                         &submission.snatch_guard,
                     ) {
-                        break 'error Err(QueueSubmitError::CommandEncoder(
-                            CommandEncoderError::Clear(e),
-                        ));
-                    }
+                        Ok(discards) => discards,
+                        Err(e) => {
+                            break 'error Err(QueueSubmitError::CommandEncoder(
+                                CommandEncoderError::Clear(e),
+                            ));
+                        }
+                    };
 
                     //Note: stateless trackers are not merged:
                     // device already knows these resources exist.
@@ -1641,16 +1672,28 @@ impl Queue {
                         break 'error Err(e.into());
                     }
 
-                    // Transition surface textures into `Present` state.
-                    // Note: we could technically do it after all of the command buffers,
-                    // but here we have a command encoder by hand, so it's easier to use it.
-                    if !used_surface_textures.is_empty() {
+                    if !depth_slice_discards.is_empty() || !used_surface_textures.is_empty() {
                         if let Err(e) = baked.encoder.open_pass(hal_label(
-                            Some("(wgpu internal) Present"),
+                            Some("(wgpu internal) Finalize"),
                             self.device.instance_flags,
                         )) {
                             break 'error Err(e.into());
                         }
+
+                        if let Err(e) = baked.initialize_discarded_depth_slices(
+                            depth_slice_discards,
+                            &mut trackers,
+                            &self.device,
+                            &submission.snatch_guard,
+                        ) {
+                            break 'error Err(QueueSubmitError::CommandEncoder(
+                                CommandEncoderError::Clear(e),
+                            ));
+                        }
+
+                        // Transition surface textures into `Present` state.
+                        // Note: we could technically do it after all of the command buffers,
+                        // but here we have a command encoder by hand, so it's easier to use it.
                         let texture_barriers = trackers
                             .textures
                             .set_from_usage_scope_and_drain_transitions(
@@ -1734,6 +1777,17 @@ impl Queue {
         api_log!("Queue::submit returned submit index {submit_index}");
 
         Ok(submit_index)
+    }
+
+    pub fn submit(&self, command_buffers: &[Arc<CommandBuffer>]) -> SubmissionIndex {
+        match self.submit_inner(command_buffers) {
+            Ok(submit_index) => submit_index,
+            Err((submit_index, e)) => {
+                self.device
+                    .handle_error(e, Some(self.label()), "Queue::submit");
+                submit_index
+            }
+        }
     }
 
     /// Allocate a submission index and prepare for a submission.
@@ -1993,6 +2047,7 @@ impl Queue {
         let mut size_info = blas.size_info;
         size_info.acceleration_structure_size = size;
 
+        let mut command_indices_lock = device.command_indices.write();
         let mut pending_writes = self.pending_writes.lock();
         let cmd_buf_raw = pending_writes.activate();
 
@@ -2024,9 +2079,6 @@ impl Queue {
                 .get_acceleration_structure_device_address(raw.as_ref())
         };
 
-        drop(snatch_guard);
-
-        let mut command_indices_lock = device.command_indices.write();
         command_indices_lock.next_acceleration_structure_build_command_index += 1;
         let built_index =
             NonZeroU64::new(command_indices_lock.next_acceleration_structure_build_command_index)

@@ -37,37 +37,44 @@ fn trace_test(test_type: TestType) {
         })
         .unwrap();
 
-    let (buffer, error) = device.create_buffer(&wgt::BufferDescriptor {
+    device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let buffer = device.create_buffer(&wgt::BufferDescriptor {
         label: None,
         size: 1024,
         usage: wgt::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    assert!(error.is_none());
+    assert!(matches!(device.pop_error_scope(), Ok(None)));
 
-    let (encoder, error) = device.create_command_encoder(&wgt::CommandEncoderDescriptor::default());
-    assert!(error.is_none());
+    device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let encoder = device.create_command_encoder(&wgt::CommandEncoderDescriptor::default());
+    assert!(matches!(device.pop_error_scope(), Ok(None)));
 
     match test_type {
         TestType::Normal => {
-            encoder.clear_buffer(buffer, 0, None).unwrap();
-            let (cmdbuf, error) = encoder.finish(&wgt::CommandBufferDescriptor::default());
-            assert!(error.is_none());
-            queue.submit(&[cmdbuf]).unwrap();
+            device.push_error_scope(wgpu::ErrorFilter::Validation);
+            encoder.clear_buffer(buffer, 0, None);
+            let cmdbuf = encoder.finish(&wgt::CommandBufferDescriptor::default());
+            queue.submit(&[cmdbuf]);
+            assert!(matches!(device.pop_error_scope(), Ok(None)));
         }
         TestType::FailedCommands => {
+            device.push_error_scope(wgpu::ErrorFilter::Validation);
             // Try to clear past the end of the buffer.
-            encoder.clear_buffer(buffer, 0, Some(2048)).unwrap();
-            let (_cmdbuf, error) = encoder.finish(&wgt::CommandBufferDescriptor::default());
-            assert!(error.is_some());
+            encoder.clear_buffer(buffer, 0, Some(2048));
+            let _cmdbuf = encoder.finish(&wgt::CommandBufferDescriptor::default());
+            assert!(matches!(device.pop_error_scope(), Ok(Some(_))));
         }
         TestType::FailedSubmit => {
+            device.push_error_scope(wgpu::ErrorFilter::Validation);
             // Destroy the buffer after encoding the clear command, before submitting it.
-            encoder.clear_buffer(buffer.clone(), 0, None).unwrap();
-            let (cmdbuf, error) = encoder.finish(&wgt::CommandBufferDescriptor::default());
-            assert!(error.is_none());
+            encoder.clear_buffer(buffer.clone(), 0, None);
+            let cmdbuf = encoder.finish(&wgt::CommandBufferDescriptor::default());
+            assert!(matches!(device.pop_error_scope(), Ok(None)));
             buffer.destroy();
-            queue.submit(&[cmdbuf]).unwrap_err();
+            device.push_error_scope(wgpu::ErrorFilter::Validation);
+            queue.submit(&[cmdbuf]);
+            assert!(matches!(device.pop_error_scope(), Ok(Some(_))));
         }
     }
 
@@ -193,9 +200,11 @@ fn trace_texture_test() {
         view_formats: Vec::new(),
     };
 
-    let (texture, error) = device.create_texture(&desc);
+    device.push_error_scope(wgpu::ErrorFilter::Validation);
 
-    assert!(error.is_none());
+    let texture = device.create_texture(&desc);
+
+    assert!(device.pop_error_scope().unwrap().is_none());
 
     let texture_error = device.create_texture_error(&desc);
 

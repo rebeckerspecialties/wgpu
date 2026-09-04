@@ -305,6 +305,8 @@ pub struct RenderPass {
     /// See <https://www.w3.org/TR/webgpu/#encoder-state>
     parent: Option<Arc<CommandEncoder>>,
 
+    device: Arc<Device>,
+
     color_attachments: ArrayVec<Option<RenderPassColorAttachment>, { hal::MAX_COLOR_ATTACHMENTS }>,
     depth_stencil_attachment: Option<ResolvedRenderPassDepthStencilAttachment<Arc<TextureView>>>,
     timestamp_writes: Option<PassTimestampWrites>,
@@ -336,6 +338,7 @@ impl RenderPass {
 
         Self {
             base: BasePass::new(label),
+            device: parent.device().clone(),
             parent: Some(parent),
             color_attachments,
             depth_stencil_attachment,
@@ -351,6 +354,7 @@ impl RenderPass {
     fn new_invalid(parent: Arc<CommandEncoder>, label: &Label, err: RenderPassError) -> Self {
         Self {
             base: BasePass::new_invalid(label, err),
+            device: parent.device().clone(),
             parent: Some(parent),
             color_attachments: ArrayVec::new(),
             depth_stencil_attachment: None,
@@ -365,6 +369,10 @@ impl RenderPass {
     #[inline]
     pub fn label(&self) -> Option<&str> {
         self.base.label.as_deref()
+    }
+
+    pub fn device(&self) -> &Arc<Device> {
+        &self.device
     }
 }
 
@@ -1134,32 +1142,80 @@ impl RenderPassInfo {
         store_op: StoreOp,
         texture_memory_actions: &mut CommandBufferTextureMemoryActions,
         view: &TextureView,
+        depth_slice: Option<u32>,
         pending_discard_init_fixups: &mut SurfacesInDiscardState,
     ) {
+        match (
+            depth_slice,
+            view.parent.desc.dimension == wgt::TextureDimension::D3,
+        ) {
+            (Some(_), true) | (None, false) => {}
+            _ => unreachable!("3D textures, but not any other kind, must specify a depth slice"),
+        }
+        // 3D textures with more than one depth slice are a special case,
+        // because we don't track initialization status per slice.
+        let partial_z = view.parent.desc.dimension == wgt::TextureDimension::D3
+            && view
+                .parent
+                .desc
+                .mip_level_size(view.selector.mips.start)
+                .is_some_and(|dim| dim.depth_or_array_layers > 1);
+
         if matches!(load_op, LoadOp::Load) {
+            // Record the initialization action for the texture. Simultaneously, collect a
+            // list of any ranges of the texture that were discarded within the current
+            // command buffer, for initialization by `fixup_discarded_surfaces`.
+            // (The analogous case for texture copies is in `handle_texture_init`.)
+            //
+            // Even when the target is a depth slice of a 3D texture, this is an action
+            // for the entire mip. In most cases that is what we want (if there is any
+            // live data in the mip at the end of a command buffer, we must have the
+            // entire thing initialized). The exception is Load+Discard of one slice in an
+            // uninitialized mip. In that case, we could initialize only one slice, and then
+            // leave the entire mip uninitialized at the end of the command buffer. But we
+            // don't optimize that, because it is a lot of complexity for a case that
+            // doesn't seem very useful (if the render targets are only used transiently,
+            // why is it important that they are volume slices?).
             pending_discard_init_fixups.extend(texture_memory_actions.register_init_action(
                 &TextureInitTrackerAction {
                     texture: view.parent.clone(),
-                    range: TextureInitRange::from(view.selector.clone()),
-                    // Note that this is needed even if the target is discarded,
+                    range: TextureInitRange::from(view),
+                    // Note that this is needed for `Load` even if the target has `StoreOp::Discard`.
                     kind: MemoryInitKind::NeedsInitializedMemory,
                 },
+                depth_slice.map(|slice| slice..slice + 1),
             ));
         } else if store_op == StoreOp::Store {
-            // Clear + Store
-            texture_memory_actions.register_implicit_init(
-                &view.parent,
-                TextureInitRange::from(view.selector.clone()),
-            );
+            if partial_z {
+                // We must initialize the entire mip due to init tracking granularity.
+                pending_discard_init_fixups.extend(texture_memory_actions.register_init_action(
+                    &TextureInitTrackerAction {
+                        texture: view.parent.clone(),
+                        range: TextureInitRange::from(view),
+                        kind: MemoryInitKind::NeedsInitializedMemory,
+                    },
+                    depth_slice.map(|slice| slice..slice + 1),
+                ));
+            } else {
+                // Clear + Store
+                texture_memory_actions
+                    .register_implicit_init(&view.parent, TextureInitRange::from(view));
+            }
         }
         if store_op == StoreOp::Discard {
-            // the discard happens at the *end* of a pass, but recording the
-            // discard right away be alright since the texture can't be used
-            // during the pass anyways
+            // The discard happens at the *end* of a pass, but recording the
+            // discard right away is fine, since attachments can't be used
+            // for any other purpose during the pass.
+            //
+            // Discards are usually deferred as long as possible (i.e. until the
+            // next use of the subresource). But discarded depth slices of 3D
+            // textures will be reinitialized at the end of the command buffer
+            // (by [`BakedCommands::initialize_discarded_depth_slices`]),
+            // because the primary init tracker does not track individual slices.
             texture_memory_actions.discard(TextureSurfaceDiscard {
                 texture: view.parent.clone(),
                 mip_level: view.selector.mips.start,
-                layer: view.selector.layers.start,
+                layer_or_depth_slice: depth_slice.unwrap_or(view.selector.layers.start),
             });
         }
     }
@@ -1191,7 +1247,6 @@ impl RenderPassInfo {
         let mut is_stencil_read_only = false;
 
         let mut render_attachments = AttachmentDataVec::<RenderAttachment>::new();
-        let mut discarded_surfaces = AttachmentDataVec::new();
         let mut divergent_discarded_depth_stencil_aspect = None;
 
         let mut attachment_location = AttachmentErrorLocation::Color {
@@ -1285,6 +1340,7 @@ impl RenderPassInfo {
                     at.depth.store_op(),
                     texture_memory_actions,
                     view,
+                    None,
                     pending_discard_init_fixups,
                 );
             } else if !ds_aspects.contains(hal::FormatAspects::DEPTH) {
@@ -1293,13 +1349,14 @@ impl RenderPassInfo {
                     at.stencil.store_op(),
                     texture_memory_actions,
                     view,
+                    None,
                     pending_discard_init_fixups,
                 );
             } else {
                 // This is the only place (anywhere in wgpu) where Stencil &
                 // Depth init state can diverge.
                 //
-                // To safe us the overhead of tracking init state of texture
+                // To save us the overhead of tracking init state of texture
                 // aspects everywhere, we're going to cheat a little bit in
                 // order to keep the init state of both Stencil and Depth
                 // aspects in sync. The expectation is that we hit this path
@@ -1308,7 +1365,8 @@ impl RenderPassInfo {
                 // Diverging LoadOp, i.e. Load + Clear:
                 //
                 // Record MemoryInitKind::NeedsInitializedMemory for the entire
-                // surface, a bit wasteful on unit but no negative effect!
+                // surface, a bit wasteful due to redundancy with Clear, but no
+                // negative effect!
                 //
                 // Rationale: If the loaded channel is uninitialized it needs
                 // clearing, the cleared channel doesn't care. (If everything is
@@ -1321,11 +1379,14 @@ impl RenderPassInfo {
                     at.depth.load_op() == LoadOp::Load || at.stencil.load_op() == LoadOp::Load;
                 if need_init_beforehand {
                     pending_discard_init_fixups.extend(
-                        texture_memory_actions.register_init_action(&TextureInitTrackerAction {
-                            texture: view.parent.clone(),
-                            range: TextureInitRange::from(view.selector.clone()),
-                            kind: MemoryInitKind::NeedsInitializedMemory,
-                        }),
+                        texture_memory_actions.register_init_action(
+                            &TextureInitTrackerAction {
+                                texture: view.parent.clone(),
+                                range: TextureInitRange::from(view.as_ref()),
+                                kind: MemoryInitKind::NeedsInitializedMemory,
+                            },
+                            None, // depth/stencil textures are never 3D
+                        ),
                     );
                 }
 
@@ -1341,7 +1402,7 @@ impl RenderPassInfo {
                     if !need_init_beforehand {
                         texture_memory_actions.register_implicit_init(
                             &view.parent,
-                            TextureInitRange::from(view.selector.clone()),
+                            TextureInitRange::from(view.as_ref()),
                         );
                     }
                     divergent_discarded_depth_stencil_aspect = Some((
@@ -1354,10 +1415,10 @@ impl RenderPassInfo {
                     ));
                 } else if at.depth.store_op() == StoreOp::Discard {
                     // Both are discarded using the regular path.
-                    discarded_surfaces.push(TextureSurfaceDiscard {
+                    texture_memory_actions.discard(TextureSurfaceDiscard {
                         texture: view.parent.clone(),
                         mip_level: view.selector.mips.start,
-                        layer: view.selector.layers.start,
+                        layer_or_depth_slice: view.selector.layers.start,
                     });
                 }
             }
@@ -1365,24 +1426,39 @@ impl RenderPassInfo {
             is_depth_read_only = at.depth.is_readonly();
             is_stencil_read_only = at.stencil.is_readonly();
 
-            let usage = if is_depth_read_only
-                && is_stencil_read_only
-                && device
+            let usage = 'b: {
+                if device
                     .downlevel
                     .flags
                     .contains(wgt::DownlevelFlags::READ_ONLY_DEPTH_STENCIL)
-            {
-                // If the texture supports TEXTURE_BINDING, it can be used as a shader
-                // resource and a read-only depth attachment simultaneously. But if it
-                // doesn't support TEXTURE_BINDING, don't attempt to transition it to a
-                // shader resource state, because DX12 will raise an error.
-                if view.desc.usage.contains(TextureUsages::TEXTURE_BINDING) {
-                    wgt::TextureUses::DEPTH_STENCIL_READ | wgt::TextureUses::RESOURCE
+                {
+                    let depth_stencil_uses = match (is_depth_read_only, is_stencil_read_only) {
+                        (true, true) => {
+                            wgt::TextureUses::DEPTH_READ | wgt::TextureUses::STENCIL_READ
+                        }
+                        (true, false) => {
+                            wgt::TextureUses::DEPTH_READ | wgt::TextureUses::STENCIL_WRITE
+                        }
+                        (false, true) => {
+                            wgt::TextureUses::DEPTH_WRITE | wgt::TextureUses::STENCIL_READ
+                        }
+                        (false, false) => {
+                            break 'b wgt::TextureUses::DEPTH_WRITE
+                                | wgt::TextureUses::STENCIL_WRITE;
+                        }
+                    };
+                    // If the texture supports TEXTURE_BINDING, it can be used as a shader
+                    // resource and a read-only depth attachment simultaneously. But if it
+                    // doesn't support TEXTURE_BINDING, don't attempt to transition it to a
+                    // shader resource state, because DX12 will raise an error.
+                    if view.desc.usage.contains(TextureUsages::TEXTURE_BINDING) {
+                        depth_stencil_uses | wgt::TextureUses::RESOURCE
+                    } else {
+                        depth_stencil_uses
+                    }
                 } else {
-                    wgt::TextureUses::DEPTH_STENCIL_READ
+                    wgt::TextureUses::DEPTH_WRITE | wgt::TextureUses::STENCIL_WRITE
                 }
-            } else {
-                wgt::TextureUses::DEPTH_STENCIL_WRITE
             };
             render_attachments.push(view.to_render_attachment(usage));
 
@@ -1394,6 +1470,8 @@ impl RenderPassInfo {
                 depth_ops: at.depth.hal_ops(),
                 stencil_ops: at.stencil.hal_ops(),
                 clear_value: (at.depth.clear_value(), at.stencil.clear_value()),
+                depth_read_only: is_depth_read_only,
+                stencil_read_only: is_stencil_read_only,
             });
         }
 
@@ -1512,6 +1590,7 @@ impl RenderPassInfo {
                 at.store_op,
                 texture_memory_actions,
                 color_view,
+                at.depth_slice,
                 pending_discard_init_fixups,
             );
             render_attachments
@@ -1579,7 +1658,7 @@ impl RenderPassInfo {
 
                 texture_memory_actions.register_implicit_init(
                     &resolve_view.parent,
-                    TextureInitRange::from(resolve_view.selector.clone()),
+                    TextureInitRange::from(resolve_view.as_ref()),
                 );
                 render_attachments
                     .push(resolve_view.to_render_attachment(wgt::TextureUses::COLOR_TARGET));
@@ -1743,15 +1822,12 @@ impl RenderPassInfo {
             };
         }
 
-        // If either only stencil or depth was discarded, we put in a special
-        // clear pass to keep the init status of the aspects in sync. We do this
-        // so we don't need to track init state for depth/stencil aspects
-        // individually.
-        //
-        // Note that we don't go the usual route of "brute force" initializing
-        // the texture when need arises here, since this path is actually
-        // something a user may genuinely want (where as the other cases are
-        // more seen along the lines as gracefully handling a user error).
+        // If one aspect of a combined depth/stencil format was discarded, we
+        // clear that aspect immediately to keep the init status of the aspects
+        // in sync. We do this so we don't need to track init state for depth/
+        // stencil aspects individually. We can't initialize the entire texture,
+        // because the user may genuinely want to preserve the data in the
+        // aspect that was not discarded.
         if let Some((aspect, view)) = self.divergent_discarded_depth_stencil_aspect {
             let (depth_ops, stencil_ops) = if aspect == wgt::TextureAspect::DepthOnly {
                 (
@@ -1775,11 +1851,13 @@ impl RenderPassInfo {
                 depth_stencil_attachment: Some(hal::DepthStencilAttachment {
                     target: hal::Attachment {
                         view: view.try_raw(snatch_guard)?,
-                        usage: wgt::TextureUses::DEPTH_STENCIL_WRITE,
+                        usage: wgt::TextureUses::DEPTH_WRITE | wgt::TextureUses::STENCIL_WRITE,
                     },
                     depth_ops,
                     stencil_ops,
                     clear_value: (0.0, 0),
+                    depth_read_only: false,
+                    stencil_read_only: false,
                 }),
                 multiview_mask: self.multiview_mask,
                 timestamp_writes: None,
@@ -1804,7 +1882,7 @@ fn check_transient_attachment_ops<V>(load_op: LoadOp<V>, store_op: StoreOp) -> b
 }
 
 impl CommandEncoder {
-    pub fn begin_render_pass(
+    fn begin_render_pass_inner(
         self: &Arc<Self>,
         desc: ResolvedRenderPassDescriptor<'_>,
     ) -> (RenderPass, Option<CommandEncoderError>) {
@@ -2121,10 +2199,22 @@ impl CommandEncoder {
             }
         }
     }
+
+    pub fn begin_render_pass(
+        self: &Arc<Self>,
+        desc: ResolvedRenderPassDescriptor<'_>,
+    ) -> RenderPass {
+        let (pass, err) = self.begin_render_pass_inner(desc);
+        if let Some(err) = err {
+            self.device
+                .handle_error(err, pass.label(), "CommandEncoder::begin_render_pass");
+        }
+        pass
+    }
 }
 
 impl RenderPass {
-    pub fn end(&mut self) -> Result<(), EncoderStateError> {
+    fn end_inner(&mut self) -> Result<(), EncoderStateError> {
         profiling::scope!(
             "CommandEncoder::run_render_pass {}",
             self.base.label.as_deref().unwrap_or("")
@@ -2162,6 +2252,13 @@ impl RenderPass {
                 multiview_mask: self.multiview_mask,
             })
         })
+    }
+
+    pub fn end(&mut self) {
+        if let Err(err) = self.end_inner() {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::end");
+        }
     }
 }
 
@@ -2602,6 +2699,8 @@ pub(super) fn encode_render_pass(
             ))
             .map_pass_err(pass_scope)?;
 
+        // If this pass reads any surfaces that were discarded by a previous
+        // pass in the same command buffer, initialize them.
         fixup_discarded_surfaces(
             pending_discard_init_fixups.into_iter(),
             transit,
@@ -2634,6 +2733,11 @@ pub(super) fn encode_render_pass(
                 )
                 .map_pass_err(pass_scope)?;
         }
+
+        // Backends may have deferred setup work for the pass's indirect
+        // multi-draws (e.g. Metal indirect-command-buffer generation); encode
+        // it after indirect validation so it reads validated draw arguments.
+        unsafe { transit.encode_deferred_multi_draws() };
     }
 
     encoder.close_and_swap().map_pass_err(pass_scope)?;
@@ -3482,7 +3586,7 @@ fn execute_bundle(
                 .pass
                 .base
                 .texture_memory_actions
-                .register_init_action(action),
+                .register_init_action(action, None),
         );
     }
 
@@ -3527,7 +3631,7 @@ fn execute_bundle(
 // that the `pass_try!` and `pass_base!` macros may return early from the
 // function that invokes them, like the `?` operator.
 impl RenderPass {
-    pub fn set_bind_group(
+    fn set_bind_group_inner(
         &mut self,
         index: u32,
         bind_group: Option<Arc<BindGroup>>,
@@ -3565,7 +3669,19 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn set_pipeline(&mut self, pipeline: Arc<RenderPipeline>) -> Result<(), PassStateError> {
+    pub fn set_bind_group(
+        &mut self,
+        index: u32,
+        bind_group: Option<Arc<BindGroup>>,
+        offsets: &[DynamicOffset],
+    ) {
+        if let Err(err) = self.set_bind_group_inner(index, bind_group, offsets) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::set_bind_group");
+        }
+    }
+
+    fn set_pipeline_inner(&mut self, pipeline: Arc<RenderPipeline>) -> Result<(), PassStateError> {
         let scope = PassErrorScope::SetPipelineRender;
 
         let redundant = self.current_pipeline.set_and_check_redundant(&pipeline);
@@ -3585,7 +3701,14 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn set_index_buffer(
+    pub fn set_pipeline(&mut self, pipeline: Arc<RenderPipeline>) {
+        if let Err(err) = self.set_pipeline_inner(pipeline) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::set_pipeline");
+        }
+    }
+
+    fn set_index_buffer_inner(
         &mut self,
         buffer: Arc<Buffer>,
         index_format: IndexFormat,
@@ -3607,7 +3730,20 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn set_vertex_buffer(
+    pub fn set_index_buffer(
+        &mut self,
+        buffer: Arc<Buffer>,
+        index_format: IndexFormat,
+        offset: BufferAddress,
+        size: Option<BufferSize>,
+    ) {
+        if let Err(err) = self.set_index_buffer_inner(buffer, index_format, offset, size) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::set_index_buffer");
+        }
+    }
+
+    fn set_vertex_buffer_inner(
         &mut self,
         slot: u32,
         buffer: Option<Arc<Buffer>>,
@@ -3634,7 +3770,20 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn set_blend_constant(&mut self, color: Color) -> Result<(), PassStateError> {
+    pub fn set_vertex_buffer(
+        &mut self,
+        slot: u32,
+        buffer: Option<Arc<Buffer>>,
+        offset: BufferAddress,
+        size: Option<BufferSize>,
+    ) {
+        if let Err(err) = self.set_vertex_buffer_inner(slot, buffer, offset, size) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::set_vertex_buffer");
+        }
+    }
+
+    fn set_blend_constant_inner(&mut self, color: Color) -> Result<(), PassStateError> {
         let scope = PassErrorScope::SetBlendConstant;
         let base = pass_base!(self, scope);
 
@@ -3644,7 +3793,14 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn set_stencil_reference(&mut self, value: u32) -> Result<(), PassStateError> {
+    pub fn set_blend_constant(&mut self, color: Color) {
+        if let Err(err) = self.set_blend_constant_inner(color) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::set_blend_constant");
+        }
+    }
+
+    fn set_stencil_reference_inner(&mut self, value: u32) -> Result<(), PassStateError> {
         let scope = PassErrorScope::SetStencilReference;
         let base = pass_base!(self, scope);
         let value = convert_stencil_value(
@@ -3659,7 +3815,14 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn set_viewport(
+    pub fn set_stencil_reference(&mut self, value: u32) {
+        if let Err(err) = self.set_stencil_reference_inner(value) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::set_stencil_reference");
+        }
+    }
+
+    fn set_viewport_inner(
         &mut self,
         x: f32,
         y: f32,
@@ -3680,7 +3843,14 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn set_scissor_rect(
+    pub fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32, depth_min: f32, depth_max: f32) {
+        if let Err(err) = self.set_viewport_inner(x, y, w, h, depth_min, depth_max) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::set_viewport");
+        }
+    }
+
+    fn set_scissor_rect_inner(
         &mut self,
         x: u32,
         y: u32,
@@ -3696,7 +3866,14 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn set_immediates(&mut self, offset: u32, data: &[u8]) -> Result<(), PassStateError> {
+    pub fn set_scissor_rect(&mut self, x: u32, y: u32, w: u32, h: u32) {
+        if let Err(err) = self.set_scissor_rect_inner(x, y, w, h) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::set_scissor_rect");
+        }
+    }
+
+    fn set_immediates_inner(&mut self, offset: u32, data: &[u8]) -> Result<(), PassStateError> {
         let scope = PassErrorScope::SetImmediate;
         let base = pass_base!(self, scope);
 
@@ -3717,7 +3894,14 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn draw(
+    pub fn set_immediates(&mut self, offset: u32, data: &[u8]) {
+        if let Err(err) = self.set_immediates_inner(offset, data) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::set_immediates");
+        }
+    }
+
+    fn draw_inner(
         &mut self,
         vertex_count: u32,
         instance_count: u32,
@@ -3740,7 +3924,22 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn draw_indexed(
+    pub fn draw(
+        &mut self,
+        vertex_count: u32,
+        instance_count: u32,
+        first_vertex: u32,
+        first_instance: u32,
+    ) {
+        if let Err(err) =
+            self.draw_inner(vertex_count, instance_count, first_vertex, first_instance)
+        {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::draw");
+        }
+    }
+
+    fn draw_indexed_inner(
         &mut self,
         index_count: u32,
         instance_count: u32,
@@ -3765,7 +3964,27 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn draw_mesh_tasks(
+    pub fn draw_indexed(
+        &mut self,
+        index_count: u32,
+        instance_count: u32,
+        first_index: u32,
+        base_vertex: i32,
+        first_instance: u32,
+    ) {
+        if let Err(err) = self.draw_indexed_inner(
+            index_count,
+            instance_count,
+            first_index,
+            base_vertex,
+            first_instance,
+        ) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::draw_indexed");
+        }
+    }
+
+    fn draw_mesh_tasks_inner(
         &mut self,
         group_count_x: u32,
         group_count_y: u32,
@@ -3785,7 +4004,14 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn draw_indirect(
+    pub fn draw_mesh_tasks(&mut self, group_count_x: u32, group_count_y: u32, group_count_z: u32) {
+        if let Err(err) = self.draw_mesh_tasks_inner(group_count_x, group_count_y, group_count_z) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::draw_mesh_tasks");
+        }
+    }
+
+    fn draw_indirect_inner(
         &mut self,
         buffer: Arc<Buffer>,
         offset: BufferAddress,
@@ -3811,7 +4037,14 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn draw_indexed_indirect(
+    pub fn draw_indirect(&mut self, buffer: Arc<Buffer>, offset: BufferAddress) {
+        if let Err(err) = self.draw_indirect_inner(buffer, offset) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::draw_indirect");
+        }
+    }
+
+    fn draw_indexed_indirect_inner(
         &mut self,
         buffer: Arc<Buffer>,
         offset: BufferAddress,
@@ -3837,7 +4070,14 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn draw_mesh_tasks_indirect(
+    pub fn draw_indexed_indirect(&mut self, buffer: Arc<Buffer>, offset: BufferAddress) {
+        if let Err(err) = self.draw_indexed_indirect_inner(buffer, offset) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::draw_indexed_indirect");
+        }
+    }
+
+    fn draw_mesh_tasks_indirect_inner(
         &mut self,
         buffer: Arc<Buffer>,
         offset: BufferAddress,
@@ -3863,7 +4103,14 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn multi_draw_indirect(
+    pub fn draw_mesh_tasks_indirect(&mut self, buffer: Arc<Buffer>, offset: BufferAddress) {
+        if let Err(err) = self.draw_mesh_tasks_indirect_inner(buffer, offset) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::draw_mesh_tasks_indirect");
+        }
+    }
+
+    fn multi_draw_indirect_inner(
         &mut self,
         buffer: Arc<Buffer>,
         offset: BufferAddress,
@@ -3882,6 +4129,40 @@ impl RenderPass {
             offset,
             count,
             family: DrawCommandFamily::Draw,
+
+            vertex_or_index_limit: None,
+            instance_limit: None,
+        });
+
+        Ok(())
+    }
+
+    pub fn multi_draw_indirect(&mut self, buffer: Arc<Buffer>, offset: BufferAddress, count: u32) {
+        if let Err(err) = self.multi_draw_indirect_inner(buffer, offset, count) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::multi_draw_indirect");
+        }
+    }
+
+    fn multi_draw_indexed_indirect_inner(
+        &mut self,
+        buffer: Arc<Buffer>,
+        offset: BufferAddress,
+        count: u32,
+    ) -> Result<(), PassStateError> {
+        let scope = PassErrorScope::Draw {
+            kind: DrawKind::MultiDrawIndirect,
+            family: DrawCommandFamily::DrawIndexed,
+        };
+        let base = pass_base!(self, scope);
+
+        pass_try!(base, scope, buffer.check_is_valid());
+
+        base.commands.push(ArcRenderCommand::DrawIndirect {
+            buffer,
+            offset,
+            count,
+            family: DrawCommandFamily::DrawIndexed,
 
             vertex_or_index_limit: None,
             instance_limit: None,
@@ -3895,29 +4176,14 @@ impl RenderPass {
         buffer: Arc<Buffer>,
         offset: BufferAddress,
         count: u32,
-    ) -> Result<(), PassStateError> {
-        let scope = PassErrorScope::Draw {
-            kind: DrawKind::MultiDrawIndirect,
-            family: DrawCommandFamily::DrawIndexed,
-        };
-        let base = pass_base!(self, scope);
-
-        pass_try!(base, scope, buffer.check_is_valid());
-
-        base.commands.push(ArcRenderCommand::DrawIndirect {
-            buffer,
-            offset,
-            count,
-            family: DrawCommandFamily::DrawIndexed,
-
-            vertex_or_index_limit: None,
-            instance_limit: None,
-        });
-
-        Ok(())
+    ) {
+        if let Err(err) = self.multi_draw_indexed_indirect_inner(buffer, offset, count) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::multi_draw_indexed_indirect");
+        }
     }
 
-    pub fn multi_draw_mesh_tasks_indirect(
+    fn multi_draw_mesh_tasks_indirect_inner(
         &mut self,
         buffer: Arc<Buffer>,
         offset: BufferAddress,
@@ -3944,7 +4210,22 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn multi_draw_indirect_count(
+    pub fn multi_draw_mesh_tasks_indirect(
+        &mut self,
+        buffer: Arc<Buffer>,
+        offset: BufferAddress,
+        count: u32,
+    ) {
+        if let Err(err) = self.multi_draw_mesh_tasks_indirect_inner(buffer, offset, count) {
+            self.device.handle_error(
+                err,
+                self.label(),
+                "RenderPass::multi_draw_mesh_tasks_indirect",
+            );
+        }
+    }
+
+    fn multi_draw_indirect_count_inner(
         &mut self,
         buffer: Arc<Buffer>,
         offset: BufferAddress,
@@ -3973,7 +4254,27 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn multi_draw_indexed_indirect_count(
+    pub fn multi_draw_indirect_count(
+        &mut self,
+        buffer: Arc<Buffer>,
+        offset: BufferAddress,
+        count_buffer: Arc<Buffer>,
+        count_buffer_offset: BufferAddress,
+        max_count: u32,
+    ) {
+        if let Err(err) = self.multi_draw_indirect_count_inner(
+            buffer,
+            offset,
+            count_buffer,
+            count_buffer_offset,
+            max_count,
+        ) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::multi_draw_indirect_count");
+        }
+    }
+
+    fn multi_draw_indexed_indirect_count_inner(
         &mut self,
         buffer: Arc<Buffer>,
         offset: BufferAddress,
@@ -4003,7 +4304,30 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn multi_draw_mesh_tasks_indirect_count(
+    pub fn multi_draw_indexed_indirect_count(
+        &mut self,
+        buffer: Arc<Buffer>,
+        offset: BufferAddress,
+        count_buffer: Arc<Buffer>,
+        count_buffer_offset: BufferAddress,
+        max_count: u32,
+    ) {
+        if let Err(err) = self.multi_draw_indexed_indirect_count_inner(
+            buffer,
+            offset,
+            count_buffer,
+            count_buffer_offset,
+            max_count,
+        ) {
+            self.device.handle_error(
+                err,
+                self.label(),
+                "RenderPass::multi_draw_indexed_indirect_count",
+            );
+        }
+    }
+
+    fn multi_draw_mesh_tasks_indirect_count_inner(
         &mut self,
         buffer: Arc<Buffer>,
         offset: BufferAddress,
@@ -4033,7 +4357,30 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn push_debug_group(&mut self, label: &str, color: u32) -> Result<(), PassStateError> {
+    pub fn multi_draw_mesh_tasks_indirect_count(
+        &mut self,
+        buffer: Arc<Buffer>,
+        offset: BufferAddress,
+        count_buffer: Arc<Buffer>,
+        count_buffer_offset: BufferAddress,
+        max_count: u32,
+    ) {
+        if let Err(err) = self.multi_draw_mesh_tasks_indirect_count_inner(
+            buffer,
+            offset,
+            count_buffer,
+            count_buffer_offset,
+            max_count,
+        ) {
+            self.device.handle_error(
+                err,
+                self.label(),
+                "RenderPass::multi_draw_mesh_tasks_indirect_count",
+            );
+        }
+    }
+
+    fn push_debug_group_inner(&mut self, label: &str, color: u32) -> Result<(), PassStateError> {
         let base = pass_base!(self, PassErrorScope::PushDebugGroup);
 
         let bytes = label.as_bytes();
@@ -4047,7 +4394,14 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn pop_debug_group(&mut self) -> Result<(), PassStateError> {
+    pub fn push_debug_group(&mut self, label: &str, color: u32) {
+        if let Err(err) = self.push_debug_group_inner(label, color) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::push_debug_group");
+        }
+    }
+
+    fn pop_debug_group_inner(&mut self) -> Result<(), PassStateError> {
         let base = pass_base!(self, PassErrorScope::PopDebugGroup);
 
         base.commands.push(ArcRenderCommand::PopDebugGroup);
@@ -4055,7 +4409,14 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn insert_debug_marker(&mut self, label: &str, color: u32) -> Result<(), PassStateError> {
+    pub fn pop_debug_group(&mut self) {
+        if let Err(err) = self.pop_debug_group_inner() {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::pop_debug_group");
+        }
+    }
+
+    fn insert_debug_marker_inner(&mut self, label: &str, color: u32) -> Result<(), PassStateError> {
         let base = pass_base!(self, PassErrorScope::InsertDebugMarker);
 
         let bytes = label.as_bytes();
@@ -4069,7 +4430,14 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn write_timestamp(
+    pub fn insert_debug_marker(&mut self, label: &str, color: u32) {
+        if let Err(err) = self.insert_debug_marker_inner(label, color) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::insert_debug_marker");
+        }
+    }
+
+    fn write_timestamp_inner(
         &mut self,
         query_set: Arc<QuerySet>,
         query_index: u32,
@@ -4086,7 +4454,14 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn begin_occlusion_query(&mut self, query_index: u32) -> Result<(), PassStateError> {
+    pub fn write_timestamp(&mut self, query_set: Arc<QuerySet>, query_index: u32) {
+        if let Err(err) = self.write_timestamp_inner(query_set, query_index) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::write_timestamp");
+        }
+    }
+
+    fn begin_occlusion_query_inner(&mut self, query_index: u32) -> Result<(), PassStateError> {
         let scope = PassErrorScope::BeginOcclusionQuery;
         let base = pass_base!(self, scope);
 
@@ -4096,7 +4471,14 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn end_occlusion_query(&mut self) -> Result<(), PassStateError> {
+    pub fn begin_occlusion_query(&mut self, query_index: u32) {
+        if let Err(err) = self.begin_occlusion_query_inner(query_index) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::begin_occlusion_query");
+        }
+    }
+
+    fn end_occlusion_query_inner(&mut self) -> Result<(), PassStateError> {
         let scope = PassErrorScope::EndOcclusionQuery;
         let base = pass_base!(self, scope);
 
@@ -4105,7 +4487,14 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn begin_pipeline_statistics_query(
+    pub fn end_occlusion_query(&mut self) {
+        if let Err(err) = self.end_occlusion_query_inner() {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::end_occlusion_query");
+        }
+    }
+
+    fn begin_pipeline_statistics_query_inner(
         &mut self,
         query_set: Arc<QuerySet>,
         query_index: u32,
@@ -4123,7 +4512,17 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn end_pipeline_statistics_query(&mut self) -> Result<(), PassStateError> {
+    pub fn begin_pipeline_statistics_query(&mut self, query_set: Arc<QuerySet>, query_index: u32) {
+        if let Err(err) = self.begin_pipeline_statistics_query_inner(query_set, query_index) {
+            self.device.handle_error(
+                err,
+                self.label(),
+                "RenderPass::begin_pipeline_statistics_query",
+            );
+        }
+    }
+
+    fn end_pipeline_statistics_query_inner(&mut self) -> Result<(), PassStateError> {
         let scope = PassErrorScope::EndPipelineStatisticsQuery;
         let base = pass_base!(self, scope);
 
@@ -4133,7 +4532,17 @@ impl RenderPass {
         Ok(())
     }
 
-    pub fn execute_bundles(
+    pub fn end_pipeline_statistics_query(&mut self) {
+        if let Err(err) = self.end_pipeline_statistics_query_inner() {
+            self.device.handle_error(
+                err,
+                self.label(),
+                "RenderPass::end_pipeline_statistics_query",
+            );
+        }
+    }
+
+    fn execute_bundles_inner(
         &mut self,
         render_bundles: &[Arc<RenderBundle>],
     ) -> Result<(), PassStateError> {
@@ -4150,6 +4559,13 @@ impl RenderPass {
         self.current_bind_groups.reset();
 
         Ok(())
+    }
+
+    pub fn execute_bundles(&mut self, render_bundles: &[Arc<RenderBundle>]) {
+        if let Err(err) = self.execute_bundles_inner(render_bundles) {
+            self.device
+                .handle_error(err, self.label(), "RenderPass::execute_bundles");
+        }
     }
 }
 

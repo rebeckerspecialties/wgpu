@@ -1,27 +1,31 @@
-use wgpu_core::device::DeviceDescriptor;
+use alloc::sync::Arc;
+
 use wgpu_core::instance::RequestDeviceError;
+use wgpu_core_remote_types::DeviceDescriptor;
+use wgpu_core_remote_types::RequestAdapterOptions;
 use wgt::Backends;
 
 use crate::global::Global;
+use crate::hub::Hub;
 use crate::id::{AdapterId, DeviceId, QueueId};
-
-pub type RequestAdapterOptions = wgt::RequestAdapterOptions<()>;
 
 impl Global {
     pub fn request_adapter(
         &self,
         desc: &RequestAdapterOptions,
+        apply_limit_buckets: bool,
         backends: Backends,
         id_in: AdapterId,
     ) -> Result<AdapterId, wgt::RequestAdapterError> {
+        let mut hub = self.hub.borrow_mut();
         let desc = wgt::RequestAdapterOptions {
             power_preference: desc.power_preference,
             force_fallback_adapter: desc.force_fallback_adapter,
             compatible_surface: None,
-            apply_limit_buckets: desc.apply_limit_buckets,
+            apply_limit_buckets,
         };
         let adapter = self.instance.request_adapter(&desc, backends)?;
-        let id = self.hub.adapters.prepare(id_in).assign(adapter);
+        let id = hub.adapters.assign(id_in, adapter);
         Ok(id)
     }
 
@@ -30,25 +34,28 @@ impl Global {
     /// The HAL adapter may be obtained e.g. by calling `enumerate_adapters` on
     /// the HAL directly.
     ///
-    /// If [limit bucketing][lt] is desired, [`crate::limits::apply_limit_buckets`]
+    /// If [limit bucketing][lt] is desired, [`wgpu_core::limits::apply_limit_buckets`]
     /// should be called with the HAL adapter before calling this function.
     ///
     /// # Safety
     ///
     /// `hal_adapter` must be created from this global internal instance handle.
     ///
-    /// [lt]: crate::limits#Limit-bucketing
+    /// [lt]: wgpu_core::limits#Limit-bucketing
     pub unsafe fn create_adapter_from_hal(
         &self,
         hal_adapter: hal::DynExposedAdapter,
         id_in: AdapterId,
     ) -> AdapterId {
-        let fid = self.hub.adapters.prepare(id_in);
-        fid.assign(unsafe { self.instance.create_adapter_from_hal(hal_adapter) })
+        let mut hub = self.hub.borrow_mut();
+        hub.adapters.assign(id_in, unsafe {
+            self.instance.create_adapter_from_hal(hal_adapter)
+        })
     }
 
     pub fn adapter_get_info(&self, adapter_id: AdapterId) -> wgt::AdapterInfo {
-        let adapter = self.hub.adapters.get(adapter_id);
+        let hub = self.hub.borrow();
+        let adapter = hub.adapters.get(adapter_id);
         adapter.get_info()
     }
 
@@ -57,17 +64,20 @@ impl Global {
         adapter_id: AdapterId,
         format: wgt::TextureFormat,
     ) -> wgt::TextureFormatFeatures {
-        let adapter = self.hub.adapters.get(adapter_id);
+        let hub = self.hub.borrow();
+        let adapter = hub.adapters.get(adapter_id);
         adapter.get_texture_format_features(format)
     }
 
     pub fn adapter_features(&self, adapter_id: AdapterId) -> wgt::Features {
-        let adapter = self.hub.adapters.get(adapter_id);
+        let hub = self.hub.borrow();
+        let adapter = hub.adapters.get(adapter_id);
         adapter.features()
     }
 
     pub fn adapter_limits(&self, adapter_id: AdapterId) -> wgt::Limits {
-        let adapter = self.hub.adapters.get(adapter_id);
+        let hub = self.hub.borrow();
+        let adapter = hub.adapters.get(adapter_id);
         adapter.limits()
     }
 
@@ -75,7 +85,8 @@ impl Global {
         &self,
         adapter_id: AdapterId,
     ) -> wgt::DownlevelCapabilities {
-        let adapter = self.hub.adapters.get(adapter_id);
+        let hub = self.hub.borrow();
+        let adapter = hub.adapters.get(adapter_id);
         adapter.downlevel_capabilities()
     }
 
@@ -83,7 +94,8 @@ impl Global {
         &self,
         adapter_id: AdapterId,
     ) -> wgt::PresentationTimestamp {
-        let adapter = self.hub.adapters.get(adapter_id);
+        let hub = self.hub.borrow();
+        let adapter = hub.adapters.get(adapter_id);
         adapter.get_presentation_timestamp()
     }
 
@@ -91,12 +103,14 @@ impl Global {
         &self,
         adapter_id: AdapterId,
     ) -> Vec<wgt::CooperativeMatrixProperties> {
-        let adapter = self.hub.adapters.get(adapter_id);
+        let hub = self.hub.borrow();
+        let adapter = hub.adapters.get(adapter_id);
         adapter.cooperative_matrix_properties()
     }
 
-    pub fn adapter_drop(&self, adapter_id: AdapterId) {
-        self.hub.adapters.remove(adapter_id);
+    pub fn adapter_remove(&self, adapter_id: AdapterId) -> Arc<wgpu_core::instance::Adapter> {
+        let mut hub = self.hub.borrow_mut();
+        hub.adapters.remove(adapter_id)
     }
 }
 
@@ -108,15 +122,20 @@ impl Global {
         device_id_in: DeviceId,
         queue_id_in: QueueId,
     ) -> Result<(DeviceId, QueueId), RequestDeviceError> {
-        let device_fid = self.hub.devices.prepare(device_id_in);
-        let queue_fid = self.hub.queues.prepare(queue_id_in);
+        let mut hub = self.hub.borrow_mut();
+        let Hub {
+            adapters,
+            devices,
+            queues,
+            ..
+        } = &mut *hub;
 
-        let adapter = self.hub.adapters.get(adapter_id);
+        let adapter = adapters.get(adapter_id);
         let (device, queue) = adapter.request_device(desc)?;
 
-        let device_id = device_fid.assign(device);
+        let device_id = devices.assign(device_id_in, device);
 
-        let queue_id = queue_fid.assign(queue);
+        let queue_id = queues.assign(queue_id_in, queue);
 
         Ok((device_id, queue_id))
     }
@@ -126,7 +145,8 @@ impl Global {
         adapter_id: AdapterId,
         desc: &mut DeviceDescriptor,
     ) -> Result<(), RequestDeviceError> {
-        let adapter = self.hub.adapters.get(adapter_id);
+        let hub = self.hub.borrow();
+        let adapter = hub.adapters.get(adapter_id);
         adapter.validate_device_descriptor(desc)
     }
 
@@ -142,16 +162,21 @@ impl Global {
         device_id_in: DeviceId,
         queue_id_in: QueueId,
     ) -> Result<(DeviceId, QueueId), RequestDeviceError> {
-        let devices_fid = self.hub.devices.prepare(device_id_in);
-        let queues_fid = self.hub.queues.prepare(queue_id_in);
+        let mut hub = self.hub.borrow_mut();
+        let Hub {
+            adapters,
+            devices,
+            queues,
+            ..
+        } = &mut *hub;
 
-        let adapter = self.hub.adapters.get(adapter_id);
+        let adapter = adapters.get(adapter_id);
         let (device, queue) =
             unsafe { adapter.create_device_and_queue_from_hal(hal_device, desc) }?;
 
-        let device_id = devices_fid.assign(device);
+        let device_id = devices.assign(device_id_in, device);
 
-        let queue_id = queues_fid.assign(queue);
+        let queue_id = queues.assign(queue_id_in, queue);
 
         Ok((device_id, queue_id))
     }

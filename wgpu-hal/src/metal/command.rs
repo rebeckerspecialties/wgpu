@@ -1,6 +1,7 @@
 use objc2::{
     rc::{autoreleasepool, Retained},
     runtime::ProtocolObject,
+    Message as _,
 };
 use objc2_foundation::{NSRange, NSString, NSUInteger};
 use objc2_metal::{
@@ -15,7 +16,9 @@ use objc2_metal::{
 
 use super::{
     adapter::{self, MAX_BUFFERS},
-    conv, TimestampQuerySupport,
+    conv,
+    icb::IcbDrawKind,
+    TimestampQuerySupport,
 };
 use crate::CommandEncoder as _;
 use alloc::{
@@ -23,8 +26,9 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::{ops::Range, ptr::NonNull, sync::atomic};
+use core::{ops::Range, ptr::NonNull};
 use smallvec::SmallVec;
+use wgpu_sync::atomic;
 
 // has to match `Temp::binding_sizes`
 const WORD_SIZE: usize = 4;
@@ -36,6 +40,8 @@ impl Default for super::CommandState {
             acceleration_structure_builder: None,
             render: None,
             compute: None,
+            render_pipeline: None,
+            render_pipeline_icb: None,
             raw_primitive_type: MTLPrimitiveType::Point,
             index: None,
             stage_infos: Default::default(),
@@ -157,7 +163,7 @@ impl super::CommandEncoder {
         self.raw_cmd_buf.as_deref()
     }
 
-    fn enter_blit(&mut self) -> Retained<ProtocolObject<dyn MTLBlitCommandEncoder>> {
+    pub(super) fn enter_blit(&mut self) -> Retained<ProtocolObject<dyn MTLBlitCommandEncoder>> {
         if self.state.blit.is_none() {
             self.leave_acceleration_structure_builder();
             debug_assert!(self.state.render.is_none() && self.state.compute.is_none());
@@ -430,6 +436,8 @@ impl super::CommandEncoder {
 
 impl super::CommandState {
     fn reset(&mut self) {
+        self.render_pipeline = None;
+        self.render_pipeline_icb = None;
         self.storage_buffer_length_map.clear();
         self.vertex_buffer_size_map.clear();
         self.stage_infos.vs.clear();
@@ -542,6 +550,8 @@ impl crate::CommandEncoder for super::CommandEncoder {
             encoder.endEncoding();
         }
         self.state.pending_timer_queries.clear();
+        self.deferred_multi_draws.clear();
+        self.deferred_multi_draw_resources.clear();
         let had_command_buffer = self.raw_cmd_buf.is_some();
         // Clear the Option first so the underlying `metal::CommandBuffer` is
         // dropped before we update the counter.
@@ -569,6 +579,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
         Ok(super::CommandBuffer {
             raw: self.raw_cmd_buf.take().unwrap(),
             queue_shared: Arc::clone(&self.queue_shared),
+            _icb_resources: core::mem::take(&mut self.deferred_multi_draw_resources),
         })
     }
 
@@ -908,13 +919,18 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 if let Some(at) = at.as_ref() {
                     let at_descriptor =
                         unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(i) };
-                    at_descriptor.setTexture(Some(&at.target.view.raw));
+                    at_descriptor.setTexture(Some(&at.target.view.attachment.texture));
+                    at_descriptor.setLevel(at.target.view.attachment.base_mip_level as _);
+                    at_descriptor.setSlice(at.target.view.attachment.base_array_layer as _);
+
                     if let Some(depth_slice) = at.depth_slice {
                         at_descriptor.setDepthPlane(depth_slice as usize);
                     }
                     if let Some(ref resolve) = at.resolve_target {
-                        //Note: the selection of levels and slices is already handled by `TextureView`
-                        at_descriptor.setResolveTexture(Some(&resolve.view.raw));
+                        at_descriptor.setResolveTexture(Some(&resolve.view.attachment.texture));
+                        at_descriptor.setResolveLevel(resolve.view.attachment.base_mip_level as _);
+                        at_descriptor
+                            .setResolveSlice(resolve.view.attachment.base_array_layer as _);
                     }
                     let load_action = if at.ops.contains(crate::AttachmentOps::LOAD) {
                         MTLLoadAction::Load
@@ -938,7 +954,9 @@ impl crate::CommandEncoder for super::CommandEncoder {
             if let Some(ref at) = desc.depth_stencil_attachment {
                 if at.target.view.aspects.contains(crate::FormatAspects::DEPTH) {
                     let at_descriptor = descriptor.depthAttachment();
-                    at_descriptor.setTexture(Some(&at.target.view.raw));
+                    at_descriptor.setTexture(Some(&at.target.view.attachment.texture));
+                    at_descriptor.setLevel(at.target.view.attachment.base_mip_level as _);
+                    at_descriptor.setSlice(at.target.view.attachment.base_array_layer as _);
 
                     let load_action = if at.depth_ops.contains(crate::AttachmentOps::LOAD) {
                         MTLLoadAction::Load
@@ -965,7 +983,9 @@ impl crate::CommandEncoder for super::CommandEncoder {
                     .contains(crate::FormatAspects::STENCIL)
                 {
                     let at_descriptor = descriptor.stencilAttachment();
-                    at_descriptor.setTexture(Some(&at.target.view.raw));
+                    at_descriptor.setTexture(Some(&at.target.view.attachment.texture));
+                    at_descriptor.setLevel(at.target.view.attachment.base_mip_level as _);
+                    at_descriptor.setSlice(at.target.view.attachment.base_array_layer as _);
 
                     let load_action = if at.stencil_ops.contains(crate::AttachmentOps::LOAD) {
                         MTLLoadAction::Load
@@ -1278,6 +1298,8 @@ impl crate::CommandEncoder for super::CommandEncoder {
 
     unsafe fn set_render_pipeline(&mut self, pipeline: &super::RenderPipeline) {
         self.state.raw_primitive_type = pipeline.raw_primitive_type;
+        self.state.render_pipeline = Some(pipeline.raw.clone());
+        self.state.render_pipeline_icb = pipeline.icb_raw.clone();
         match pipeline.vs_info {
             Some(ref info) => self.state.stage_infos.vs.assign_from(info),
             None => self.state.stage_infos.vs.clear(),
@@ -1596,6 +1618,9 @@ impl crate::CommandEncoder for super::CommandEncoder {
         mut offset: wgt::BufferAddress,
         draw_count: u32,
     ) {
+        if unsafe { self.defer_multi_draw_via_icb(IcbDrawKind::Draw, buffer, offset, draw_count) } {
+            return;
+        }
         let encoder = self.state.render.as_ref().unwrap();
         for _ in 0..draw_count {
             unsafe {
@@ -1615,6 +1640,17 @@ impl crate::CommandEncoder for super::CommandEncoder {
         mut offset: wgt::BufferAddress,
         draw_count: u32,
     ) {
+        let kind = {
+            let index = self.state.index.as_ref().unwrap();
+            IcbDrawKind::DrawIndexed {
+                index_buffer: unsafe { index.buffer_ptr.as_ref() }.retain(),
+                index_offset: index.offset,
+                raw_index_type: index.raw_type,
+            }
+        };
+        if unsafe { self.defer_multi_draw_via_icb(kind, buffer, offset, draw_count) } {
+            return;
+        }
         let encoder = self.state.render.as_ref().unwrap();
         let index = self.state.index.as_ref().unwrap();
         for _ in 0..draw_count {
@@ -1638,6 +1674,23 @@ impl crate::CommandEncoder for super::CommandEncoder {
         mut offset: wgt::BufferAddress,
         draw_count: u32,
     ) {
+        let kind = {
+            let ts = self.state.stage_infos.ts.raw_wg_size;
+            let ms = self.state.stage_infos.ms.raw_wg_size;
+            IcbDrawKind::DrawMeshTasks {
+                threadgroup_sizes: [
+                    ts.width as u32,
+                    ts.height as u32,
+                    ts.depth as u32,
+                    ms.width as u32,
+                    ms.height as u32,
+                    ms.depth as u32,
+                ],
+            }
+        };
+        if unsafe { self.defer_multi_draw_via_icb(kind, buffer, offset, draw_count) } {
+            return;
+        }
         let encoder = self.state.render.as_ref().unwrap();
         for _ in 0..draw_count {
             unsafe {
@@ -1682,6 +1735,10 @@ impl crate::CommandEncoder for super::CommandEncoder {
         _max_count: u32,
     ) {
         unreachable!()
+    }
+
+    unsafe fn encode_deferred_multi_draws(&mut self) {
+        unsafe { self.encode_deferred_icb_generation() }
     }
 
     // compute

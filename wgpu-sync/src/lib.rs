@@ -9,24 +9,40 @@
 
 //! Provides [`Mutex`] and [`RwLock`] types with an appropriate implementation.
 
-// alloc and std aren't directly used by this crate, but we reserve features
-// for them and ensure the respective crates and linked to allow future usage.
-#[cfg(feature = "alloc")]
 extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+pub mod atomic;
 mod mutex;
 mod rwlock;
 
 pub use mutex::RawMutex;
 pub use rwlock::RawRwLock;
 
+cfg_if::cfg_if! {
+    if #[cfg(target_has_atomic = "ptr")] {
+        pub use alloc::sync::{Arc, Weak};
+    } else if #[cfg(feature = "portable-atomic")] {
+        pub use portable_atomic_util::{Arc, Weak};
+    }
+}
+
 // FIXME:
 // * `Condvar` is only available through `parking_lot` and not through `lock_api`.
 // * `Condvar` only works with the specific `RawMutex` implementation from `parking_lot`.
 #[cfg(feature = "std")]
 pub use parking_lot::{Condvar, Mutex as CondvarMutex};
+
+pub use once_cell::race::{OnceBool, OnceBox, OnceNonZeroUsize, OnceRef};
+
+cfg_if::cfg_if! {
+    if #[cfg(feature = "std")] {
+        pub use once_cell::sync::{Lazy, OnceCell};
+    } else {
+        pub use once_cell::unsync::{Lazy, OnceCell};
+    }
+}
 
 /// A [`Mutex`](lock_api::Mutex) using [`RawMutex`] for its backing implementation.
 pub type Mutex<T> = lock_api::Mutex<RawMutex, T>;

@@ -1,10 +1,13 @@
-use wgpu_core::command::{CommandEncoderError, EncoderStateError};
-use wgpu_core::Label;
+use wgpu_core_remote_types::encoders::{
+    CommandBufferDescriptor, CommandEncoderCommand, DebugCommand, TexelCopyBufferInfo,
+    TexelCopyTextureInfo,
+};
 use wgt::{BufferAddress, Extent3d, ImageSubresourceRange};
 
 use crate::global::Global;
+use crate::hub::Hub;
+use crate::id;
 use crate::id::{BufferId, CommandEncoderId, TextureId};
-use crate::{id, TexelCopyBufferInfo};
 
 impl Global {
     /// Finishes a command encoder, creating a command buffer and returning errors that were
@@ -17,45 +20,37 @@ impl Global {
     pub fn command_encoder_finish(
         &self,
         encoder_id: CommandEncoderId,
-        desc: &wgt::CommandBufferDescriptor<Label>,
+        desc: &CommandBufferDescriptor,
         id_in: id::CommandBufferId,
-    ) -> (id::CommandBufferId, Option<(String, CommandEncoderError)>) {
-        let hub = &self.hub;
-        let cmd_enc = hub.command_encoders.get(encoder_id);
+    ) {
+        let mut hub = self.hub.borrow_mut();
+        let Hub {
+            command_encoders,
+            command_buffers,
+            ..
+        } = &mut *hub;
+        let cmd_enc = command_encoders.get(encoder_id);
 
-        let (cmd_buf, opt_error) = cmd_enc.finish(desc);
-        let cmd_buf_id = hub.command_buffers.prepare(id_in).assign(cmd_buf);
-
-        (cmd_buf_id, opt_error)
+        let cmd_buf = cmd_enc.finish(desc);
+        command_buffers.assign(id_in, cmd_buf);
     }
 
-    pub fn command_encoder_push_debug_group(
-        &self,
-        encoder_id: CommandEncoderId,
-        label: &str,
-    ) -> Result<(), EncoderStateError> {
-        let hub = &self.hub;
+    pub fn command_encoder_push_debug_group(&self, encoder_id: CommandEncoderId, label: &str) {
+        let hub = self.hub.borrow();
 
         let cmd_enc = hub.command_encoders.get(encoder_id);
         cmd_enc.push_debug_group(label)
     }
 
-    pub fn command_encoder_insert_debug_marker(
-        &self,
-        encoder_id: CommandEncoderId,
-        label: &str,
-    ) -> Result<(), EncoderStateError> {
-        let hub = &self.hub;
+    pub fn command_encoder_insert_debug_marker(&self, encoder_id: CommandEncoderId, label: &str) {
+        let hub = self.hub.borrow();
 
         let cmd_enc = hub.command_encoders.get(encoder_id);
         cmd_enc.insert_debug_marker(label)
     }
 
-    pub fn command_encoder_pop_debug_group(
-        &self,
-        encoder_id: CommandEncoderId,
-    ) -> Result<(), EncoderStateError> {
-        let hub = &self.hub;
+    pub fn command_encoder_pop_debug_group(&self, encoder_id: CommandEncoderId) {
+        let hub = self.hub.borrow();
 
         let cmd_enc = hub.command_encoders.get(encoder_id);
         cmd_enc.pop_debug_group()
@@ -69,8 +64,8 @@ impl Global {
         dst: BufferId,
         offset: BufferAddress,
         size: Option<BufferAddress>,
-    ) -> Result<(), EncoderStateError> {
-        let hub = &self.hub;
+    ) {
+        let hub = self.hub.borrow();
 
         let cmd_enc = hub.command_encoders.get(command_encoder_id);
         cmd_enc.clear_buffer(hub.buffers.get(dst), offset, size)
@@ -81,8 +76,8 @@ impl Global {
         command_encoder_id: CommandEncoderId,
         dst: TextureId,
         subresource_range: &ImageSubresourceRange,
-    ) -> Result<(), EncoderStateError> {
-        let hub = &self.hub;
+    ) {
+        let hub = self.hub.borrow();
 
         let cmd_enc = hub.command_encoders.get(command_encoder_id);
 
@@ -96,8 +91,8 @@ impl Global {
         command_encoder_id: CommandEncoderId,
         query_set_id: id::QuerySetId,
         query_index: u32,
-    ) -> Result<(), EncoderStateError> {
-        let hub = &self.hub;
+    ) {
+        let hub = self.hub.borrow();
 
         let cmd_enc = hub.command_encoders.get(command_encoder_id);
         cmd_enc.write_timestamp(hub.query_sets.get(query_set_id), query_index)
@@ -111,8 +106,8 @@ impl Global {
         query_count: u32,
         destination: BufferId,
         destination_offset: BufferAddress,
-    ) -> Result<(), EncoderStateError> {
-        let hub = &self.hub;
+    ) {
+        let hub = self.hub.borrow();
 
         let cmd_enc = hub.command_encoders.get(command_encoder_id);
 
@@ -135,12 +130,12 @@ impl Global {
         destination: BufferId,
         destination_offset: BufferAddress,
         size: Option<BufferAddress>,
-    ) -> Result<(), EncoderStateError> {
-        let hub = &self.hub;
+    ) {
+        let hub = self.hub.borrow();
 
         let cmd_enc = hub.command_encoders.get(command_encoder_id);
-        let source = self.resolve_buffer_id(source);
-        let destination = self.resolve_buffer_id(destination);
+        let source = hub.buffers.get(source);
+        let destination = hub.buffers.get(destination);
         cmd_enc.copy_buffer_to_buffer(source, source_offset, destination, destination_offset, size)
     }
 
@@ -148,16 +143,17 @@ impl Global {
         &self,
         command_encoder_id: CommandEncoderId,
         source: &TexelCopyBufferInfo,
-        destination: &wgt::TexelCopyTextureInfo<TextureId>,
+        destination: &TexelCopyTextureInfo,
         copy_size: &Extent3d,
-    ) -> Result<(), EncoderStateError> {
-        let cmd_enc = self.hub.command_encoders.get(command_encoder_id);
+    ) {
+        let hub = self.hub.borrow();
+        let cmd_enc = hub.command_encoders.get(command_encoder_id);
         let source = wgt::TexelCopyBufferInfo {
-            buffer: self.resolve_buffer_id(source.buffer),
+            buffer: hub.buffers.get(source.buffer),
             layout: source.layout,
         };
         let destination = wgt::TexelCopyTextureInfo {
-            texture: self.resolve_texture_id(destination.texture),
+            texture: hub.textures.get(destination.texture),
             mip_level: destination.mip_level,
             origin: destination.origin,
             aspect: destination.aspect,
@@ -168,20 +164,21 @@ impl Global {
     pub fn command_encoder_copy_texture_to_buffer(
         &self,
         command_encoder_id: CommandEncoderId,
-        source: &wgt::TexelCopyTextureInfo<TextureId>,
+        source: &TexelCopyTextureInfo,
         destination: &TexelCopyBufferInfo,
         copy_size: &Extent3d,
-    ) -> Result<(), EncoderStateError> {
-        let cmd_enc = self.hub.command_encoders.get(command_encoder_id);
+    ) {
+        let hub = self.hub.borrow();
+        let cmd_enc = hub.command_encoders.get(command_encoder_id);
 
         let source = wgt::TexelCopyTextureInfo {
-            texture: self.resolve_texture_id(source.texture),
+            texture: hub.textures.get(source.texture),
             mip_level: source.mip_level,
             origin: source.origin,
             aspect: source.aspect,
         };
         let destination = wgt::TexelCopyBufferInfo {
-            buffer: self.resolve_buffer_id(destination.buffer),
+            buffer: hub.buffers.get(destination.buffer),
             layout: destination.layout,
         };
         cmd_enc.copy_texture_to_buffer(&source, &destination, copy_size)
@@ -190,20 +187,21 @@ impl Global {
     pub fn command_encoder_copy_texture_to_texture(
         &self,
         command_encoder_id: CommandEncoderId,
-        source: &wgt::TexelCopyTextureInfo<TextureId>,
-        destination: &wgt::TexelCopyTextureInfo<TextureId>,
+        source: &TexelCopyTextureInfo,
+        destination: &TexelCopyTextureInfo,
         copy_size: &Extent3d,
-    ) -> Result<(), EncoderStateError> {
-        let cmd_enc = self.hub.command_encoders.get(command_encoder_id);
+    ) {
+        let hub = self.hub.borrow();
+        let cmd_enc = hub.command_encoders.get(command_encoder_id);
 
         let source = wgt::TexelCopyTextureInfo {
-            texture: self.resolve_texture_id(source.texture),
+            texture: hub.textures.get(source.texture),
             mip_level: source.mip_level,
             origin: source.origin,
             aspect: source.aspect,
         };
         let destination = wgt::TexelCopyTextureInfo {
-            texture: self.resolve_texture_id(destination.texture),
+            texture: hub.textures.get(destination.texture),
             mip_level: destination.mip_level,
             origin: destination.origin,
             aspect: destination.aspect,
@@ -213,37 +211,106 @@ impl Global {
 }
 
 impl Global {
-    pub fn command_encoder_transition_resources(
+    pub fn handle_command_encoder_command<'a>(
         &self,
         command_encoder_id: CommandEncoderId,
-        buffer_transitions: impl Iterator<Item = wgt::BufferTransition<BufferId>>,
-        texture_transitions: impl Iterator<Item = wgt::TextureTransition<TextureId>>,
-    ) -> Result<(), EncoderStateError> {
-        let hub = &self.hub;
-
-        let cmd_enc = hub.command_encoders.get(command_encoder_id);
-        let buffer_transitions = buffer_transitions
-            .map(|t| {
-                let buffer = hub.buffers.get(t.buffer);
-                wgt::BufferTransition {
-                    buffer,
-                    state: t.state,
+        command: CommandEncoderCommand<'a>,
+    ) {
+        match command {
+            CommandEncoderCommand::BeginRenderPass {
+                desc,
+                render_pass_encoder_id,
+            } => self.command_encoder_begin_render_pass(
+                command_encoder_id,
+                &desc,
+                render_pass_encoder_id,
+            ),
+            CommandEncoderCommand::BeginComputePass {
+                desc,
+                compute_pass_encoder_id,
+            } => self.command_encoder_begin_compute_pass(
+                command_encoder_id,
+                &desc,
+                compute_pass_encoder_id,
+            ),
+            CommandEncoderCommand::CopyBufferToBuffer {
+                source,
+                source_offset,
+                destination,
+                destination_offset,
+                size,
+            } => self.command_encoder_copy_buffer_to_buffer(
+                command_encoder_id,
+                source,
+                source_offset,
+                destination,
+                destination_offset,
+                size,
+            ),
+            CommandEncoderCommand::CopyBufferToTexture {
+                source,
+                destination,
+                copy_size,
+            } => self.command_encoder_copy_buffer_to_texture(
+                command_encoder_id,
+                &source,
+                &destination,
+                &copy_size,
+            ),
+            CommandEncoderCommand::CopyTextureToBuffer {
+                source,
+                destination,
+                copy_size,
+            } => self.command_encoder_copy_texture_to_buffer(
+                command_encoder_id,
+                &source,
+                &destination,
+                &copy_size,
+            ),
+            CommandEncoderCommand::CopyTextureToTexture {
+                source,
+                destination,
+                copy_size,
+            } => self.command_encoder_copy_texture_to_texture(
+                command_encoder_id,
+                &source,
+                &destination,
+                &copy_size,
+            ),
+            CommandEncoderCommand::ClearBuffer {
+                buffer,
+                offset,
+                size,
+            } => self.command_encoder_clear_buffer(command_encoder_id, buffer, offset, size),
+            CommandEncoderCommand::ResolveQuerySet {
+                query_set,
+                first_query,
+                query_count,
+                destination,
+                destination_offset,
+            } => self.command_encoder_resolve_query_set(
+                command_encoder_id,
+                query_set,
+                first_query,
+                query_count,
+                destination,
+                destination_offset,
+            ),
+            CommandEncoderCommand::DebugCommand(debug_command) => match debug_command {
+                DebugCommand::PushDebugGroup(label) => {
+                    self.command_encoder_push_debug_group(command_encoder_id, &label)
                 }
-            })
-            .collect::<Vec<_>>();
-        let texture_transitions = texture_transitions
-            .map(|t| {
-                let texture = hub.textures.get(t.texture);
-                wgt::TextureTransition {
-                    texture,
-                    selector: t.selector,
-                    state: t.state,
+                DebugCommand::PopDebugGroup => {
+                    self.command_encoder_pop_debug_group(command_encoder_id)
                 }
-            })
-            .collect::<Vec<_>>();
-        cmd_enc.transition_resources(
-            buffer_transitions.into_iter(),
-            texture_transitions.into_iter(),
-        )
+                DebugCommand::InsertDebugMarker(label) => {
+                    self.command_encoder_insert_debug_marker(command_encoder_id, &label)
+                }
+            },
+            CommandEncoderCommand::Finish {
+                desc,
+                command_buffer_id,
+            } => self.command_encoder_finish(command_encoder_id, &desc, command_buffer_id),
+        }
     }
 }

@@ -15,6 +15,7 @@ use serde::Deserialize;
 #[cfg(feature = "serde")]
 use serde::Serialize;
 
+use wgpu_sync::OnceCell;
 use wgt::error::{ErrorType, WebGpuError};
 
 use crate::{
@@ -232,6 +233,10 @@ pub enum CreateBindGroupError {
     },
     #[error("Storage texture bindings must have a single mip level, but given a view with mip_level_count = {mip_level_count:?} at binding {binding}")]
     InvalidStorageTextureMipLevelCount { binding: u32, mip_level_count: u32 },
+    #[error("Storage texture bindings must have an identity swizzle, but given a view with swizzle = {swizzle:?}")]
+    InvalidStorageTextureSwizzle {
+        swizzle: wgt::TextureComponentSwizzle,
+    },
     #[error("External texture bindings must have a single mip level, but given a view with mip_level_count = {mip_level_count:?} at binding {binding}")]
     InvalidExternalTextureMipLevelCount { binding: u32, mip_level_count: u32 },
     #[error("External texture bindings must have a format of `rgba8unorm`, `bgra8unorm`, or `rgba16float, but given a view with format = {format:?} at binding {binding}")]
@@ -289,6 +294,7 @@ impl WebGpuError for CreateBindGroupError {
             | Self::InvalidTextureDimension { .. }
             | Self::InvalidStorageTextureFormat { .. }
             | Self::InvalidStorageTextureMipLevelCount { .. }
+            | Self::InvalidStorageTextureSwizzle { .. }
             | Self::WrongSamplerComparison { .. }
             | Self::WrongSamplerFiltering { .. }
             | Self::DepthStencilAspect
@@ -793,7 +799,7 @@ pub struct BindGroupLayout {
     pub(crate) state: ResourceState<BindGroupLayoutState>,
     pub(crate) device: Arc<Device>,
     pub(crate) entries: bgl::EntryMap,
-    pub(crate) exclusive_pipeline: crate::OnceCellOrLock<ExclusivePipeline>,
+    pub(crate) exclusive_pipeline: OnceCell<ExclusivePipeline>,
     /// The `label` from the descriptor used to create the resource.
     pub(crate) label: String,
 }
@@ -874,7 +880,7 @@ impl BindGroupLayout {
             }),
             device: device.clone(),
             entries: bgl::EntryMap::default(),
-            exclusive_pipeline: crate::OnceCellOrLock::from(exclusive_pipeline),
+            exclusive_pipeline: OnceCell::from(exclusive_pipeline),
             label: String::new(),
         })
     }
@@ -884,7 +890,7 @@ impl BindGroupLayout {
             state: ResourceState::Invalid,
             device: device.clone(),
             entries: bgl::EntryMap::default(),
-            exclusive_pipeline: crate::OnceCellOrLock::from(ExclusivePipeline::None),
+            exclusive_pipeline: OnceCell::from(ExclusivePipeline::None),
             label,
         })
     }
