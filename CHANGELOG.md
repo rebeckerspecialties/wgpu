@@ -128,6 +128,7 @@ By @sagudev in [#10109](https://github.com/gfx-rs/wgpu/pull/10109).
 #### Hal
 
 - Add `BufferBinding::buffer`, a public read accessor for the bound buffer, which was previously inaccessible to out-of-tree `wgpu_hal::Api` implementations. By @danlehmann in [#9820](https://github.com/gfx-rs/wgpu/pull/9820).
+- Added `CommandEncoder::encode_deferred_multi_draws` (default no-op). Backends may defer part of the work for indirect multi-draws recorded in a render pass; after ending such a pass, callers must invoke this method while recording a command buffer that the queue executes before the pass's. wgpu-core does this in its internal pre-pass. By @matthargett in [#9640](https://github.com/gfx-rs/wgpu/pull/9640).
 - Allow specifying a queue family ownership transfer when transitioning a texture. `hal::TextureBarrier` gained an optional `queue_family_ownership_transfer` field (honored only by the Vulkan backend) so that images imported from external memory can be acquired from and released back to the queue family of an external or foreign owner, described by the new `hal::QueueFamily` enum. Resolves [#2948](https://github.com/gfx-rs/wgpu/issues/2948). By @alexander-bruun in [#9668](https://github.com/gfx-rs/wgpu/pull/9668).
 - Add `wgpu_hal::vulkan::Surface::set_next_present_chain`, which attaches a caller-provided `pNext` chain to the `VkPresentInfoKHR` of the surface's next presentation. With `Adapter::open_with_callback` to enable the device extension, this supports presentation extensions wgpu has no dedicated support for, such as [VK_NV_present_metering](https://registry.khronos.org/vulkan/specs/latest/man/html/VK_NV_present_metering.html) for metering the display timing of frame-generation frames. By @stuartparmenter in [#9847](https://github.com/gfx-rs/wgpu/pull/9847).
 - Add `wgpu_hal::vulkan::AccelerationStructure::raw_handle`, which returns the underlying `VkAccelerationStructureKHR`. Use it with `Adapter::open_with_callback` to record acceleration structure commands from extensions wgpu doesn't support, such as [VK_NV_cluster_acceleration_structure](https://registry.khronos.org/vulkan/specs/latest/man/html/VK_NV_cluster_acceleration_structure.html). Mark the result with `CommandEncoder::mark_acceleration_structures_built`. By @stuartparmenter in [#10187](https://github.com/gfx-rs/wgpu/pull/10187).
@@ -136,6 +137,7 @@ By @sagudev in [#10109](https://github.com/gfx-rs/wgpu/pull/10109).
 #### Metal
 
 - Fix Naga's Metal backend crashing when a storage texture was used as a function argument. By @ErichDonGubler in [#9867](https://github.com/gfx-rs/wgpu/pull/9867).
+- Metal now lowers fixed-count `multi_draw_indirect` / `multi_draw_indexed_indirect` (and their mesh-task counterpart) with 512 or more draws to GPU-generated indirect command buffers, drawn from a per-adapter pool that retains at most 128 MiB. Metal spends 0.65-1.6 KB of memory per command depending on the GPU, so multi-draws whose command buffer would exceed 64 MiB keep the per-draw loop. The generation compute runs in the internal pre-pass command buffer that already carries indirect-draw validation, so the render pass is never interrupted. By @matthargett in [#9640](https://github.com/gfx-rs/wgpu/pull/9640).
 - Fix `max_task_workgroup_count` being misreported on pre-Apple7 devices. By @inner-daemons in [#10065](https://github.com/gfx-rs/wgpu/pull/10065).
 
 #### GLES
@@ -178,6 +180,11 @@ By @sagudev in [#10109](https://github.com/gfx-rs/wgpu/pull/10109).
 #### Metal
 
 - Removed the `size` argument to `wgpu_hal::metal::Device::buffer_from_raw`. The passed size value was previously used only to resolve vertex buffer bindings without an explicit size, possibly incorrectly. Binding sizes are now resolved in `wgpu-core`. By @andyleiserson in [#9848](https://github.com/gfx-rs/wgpu/pull/9848).
+
+#### Vulkan
+
+- Sub-allocate `wgpu_hal::MemoryFlags::TRANSIENT` buffers and acceleration structure build scratch from a separate Vulkan memory pool, so short-lived allocations no longer pin memory blocks shared with long-lived resources. By @stuartparmenter in [#10232](https://github.com/gfx-rs/wgpu/pull/10232).
+- Allocate acceleration structures created with `AccelerationStructureFlags::ALLOW_COMPACTION` from the transient Vulkan memory pool, since they are usually replaced by their compacted copies. By @stuartparmenter in [#10233](https://github.com/gfx-rs/wgpu/pull/10233).
 
 ### Bug Fixes
 
@@ -242,6 +249,7 @@ By @sagudev in [#10109](https://github.com/gfx-rs/wgpu/pull/10109).
 - Request `VK_KHR_spirv_1_4` and raise the generated SPIR-V version to 1.4 when `EXPERIMENTAL_RAY_TRACING_PIPELINES` or `EXPERIMENTAL_MESH_SHADER` is enabled on a pre-Vulkan-1.2 device. Both `SPV_KHR_ray_tracing` and `SPV_EXT_mesh_shader` require SPIR-V 1.4, but shaders were generated as 1.3 there: ray tracing pipelines requested neither the extension nor the version, and mesh shaders requested the extension without raising the version. Naga now rejects ray tracing pipeline shaders targeting below SPIR-V 1.4, as it already did for mesh shaders. By @JMS55 in [#10193](https://github.com/gfx-rs/wgpu/pull/10193).
 - Fix feature detection for [Robust Image Access](https://docs.vulkan.org/spec/latest/chapters/shaders.html#shaders-robust-image-access) when `VK_EXT_robustness2` is present but reports no support for [Robust Image Access 2](https://docs.vulkan.org/spec/latest/chapters/shaders.html#shaders-robust-image-access2), fixing a shader compilation crash on some Mali drivers. By @raphlinus in [#10291](https://github.com/gfx-rs/wgpu/pull/10291).
 - Fixed a panic on the Vulkan backend when dropping a surface whose acquired texture was still alive (e.g. after `present` failed due to a lost device). By @MarcelStruckWO in [#10230](https://github.com/gfx-rs/wgpu/pull/10230).
+- Recover from `VK_ERROR_FRAGMENTED_POOL` and `VK_ERROR_OUT_OF_POOL_MEMORY` when allocating descriptor sets by resetting or retiring the offending pool and retrying on the next available (or a freshly created) pool instead of panicking. By @beicause in [#10264](https://github.com/gfx-rs/wgpu/pull/10264).
 
 #### Metal
 
