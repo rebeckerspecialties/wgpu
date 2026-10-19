@@ -82,6 +82,25 @@ By @beicause in [#9553](https://github.com/gfx-rs/wgpu/pull/9553).
 
 By @sagudev in [#10109](https://github.com/gfx-rs/wgpu/pull/10109).
 
+#### `BufferView`s will block unmapping of `Buffer` on native
+
+To prevent `Buffer` being unmapped while any `BufferView`s are active,
+which could lead to SIGSEGV on native,
+`BufferView` and `BufferViewMut` now blocks unmapping of native buffer
+until all views are dropped.
+Users should keep views alive for shortest time as possible.
+To encourage this `Buffer::destroy` and `Device::destroy` will now panic if there are any outstanding `BufferView` or `BufferViewMut` alive (in addition to `Buffer::unmap` which already panicked in such cases).
+To prevent deadlocks one should also not keep views alive across `Device::poll` or `Queue::submit` or `Surface::configure`,
+as it could trigger buffer destruction and thus unmapping in case the device is lost.
+
+By @sagudev in [#10307](https://github.com/gfx-rs/wgpu/pull/10307).
+
+#### `BufferView` are not supported on `MapMode::Write` mapped buffers
+
+`MapMode::Write` mapped buffers are not supported to create `BufferView`s (read only mapping) from them.
+
+By @sagudev in [#10307](https://github.com/gfx-rs/wgpu/pull/10307).
+
 ### Added/New Features
 
 #### General
@@ -128,6 +147,7 @@ By @sagudev in [#10109](https://github.com/gfx-rs/wgpu/pull/10109).
 #### Hal
 
 - Add `BufferBinding::buffer`, a public read accessor for the bound buffer, which was previously inaccessible to out-of-tree `wgpu_hal::Api` implementations. By @danlehmann in [#9820](https://github.com/gfx-rs/wgpu/pull/9820).
+- Added `CommandEncoder::encode_deferred_multi_draws` (default no-op). Backends may defer part of the work for indirect multi-draws recorded in a render pass; after ending such a pass, callers must invoke this method while recording a command buffer that the queue executes before the pass's. wgpu-core does this in its internal pre-pass. By @matthargett in [#9640](https://github.com/gfx-rs/wgpu/pull/9640).
 - Allow specifying a queue family ownership transfer when transitioning a texture. `hal::TextureBarrier` gained an optional `queue_family_ownership_transfer` field (honored only by the Vulkan backend) so that images imported from external memory can be acquired from and released back to the queue family of an external or foreign owner, described by the new `hal::QueueFamily` enum. Resolves [#2948](https://github.com/gfx-rs/wgpu/issues/2948). By @alexander-bruun in [#9668](https://github.com/gfx-rs/wgpu/pull/9668).
 - Add `wgpu_hal::vulkan::Surface::set_next_present_chain`, which attaches a caller-provided `pNext` chain to the `VkPresentInfoKHR` of the surface's next presentation. With `Adapter::open_with_callback` to enable the device extension, this supports presentation extensions wgpu has no dedicated support for, such as [VK_NV_present_metering](https://registry.khronos.org/vulkan/specs/latest/man/html/VK_NV_present_metering.html) for metering the display timing of frame-generation frames. By @stuartparmenter in [#9847](https://github.com/gfx-rs/wgpu/pull/9847).
 - Add `wgpu_hal::vulkan::AccelerationStructure::raw_handle`, which returns the underlying `VkAccelerationStructureKHR`. Use it with `Adapter::open_with_callback` to record acceleration structure commands from extensions wgpu doesn't support, such as [VK_NV_cluster_acceleration_structure](https://registry.khronos.org/vulkan/specs/latest/man/html/VK_NV_cluster_acceleration_structure.html). Mark the result with `CommandEncoder::mark_acceleration_structures_built`. By @stuartparmenter in [#10187](https://github.com/gfx-rs/wgpu/pull/10187).
@@ -136,6 +156,7 @@ By @sagudev in [#10109](https://github.com/gfx-rs/wgpu/pull/10109).
 #### Metal
 
 - Fix Naga's Metal backend crashing when a storage texture was used as a function argument. By @ErichDonGubler in [#9867](https://github.com/gfx-rs/wgpu/pull/9867).
+- Metal now runs fixed-count multi-draws of 512 or more draws through GPU-generated indirect command buffers, instead of one indirect draw per command on the CPU. This is off with `InstanceFlags::STRICT_WEBGPU_COMPLIANCE`. The memory they hold is reported as `HalCounters::indirect_command_buffer_memory`, and pooled ones unused for two seconds are released. By @matthargett in [#9640](https://github.com/gfx-rs/wgpu/pull/9640).
 - Fix `max_task_workgroup_count` being misreported on pre-Apple7 devices. By @inner-daemons in [#10065](https://github.com/gfx-rs/wgpu/pull/10065).
 
 #### GLES
@@ -151,6 +172,7 @@ By @sagudev in [#10109](https://github.com/gfx-rs/wgpu/pull/10109).
 #### WebGPU
 
 - Add `Device::import_external_texture` to bind a `GPUExternalTexture` sampled from an `HTMLVideoElement` or WebCodecs `VideoFrame`, without a copy. By @AdrianEddy in [#9936](https://github.com/gfx-rs/wgpu/pull/9936).
+- The `subgroups` feature (and any other features added in the future) will now be reported by the WebGPU backend, if reported by the underlying WebGPU implementation. By @andyleiserson in [#10265](https://github.com/gfx-rs/wgpu/pull/10265).
 
 ### Changes
 
@@ -179,6 +201,11 @@ By @sagudev in [#10109](https://github.com/gfx-rs/wgpu/pull/10109).
 
 - Removed the `size` argument to `wgpu_hal::metal::Device::buffer_from_raw`. The passed size value was previously used only to resolve vertex buffer bindings without an explicit size, possibly incorrectly. Binding sizes are now resolved in `wgpu-core`. By @andyleiserson in [#9848](https://github.com/gfx-rs/wgpu/pull/9848).
 
+#### Vulkan
+
+- Sub-allocate `wgpu_hal::MemoryFlags::TRANSIENT` buffers and acceleration structure build scratch from a separate Vulkan memory pool, so short-lived allocations no longer pin memory blocks shared with long-lived resources. By @stuartparmenter in [#10232](https://github.com/gfx-rs/wgpu/pull/10232).
+- Allocate acceleration structures created with `AccelerationStructureFlags::ALLOW_COMPACTION` from the transient Vulkan memory pool, since they are usually replaced by their compacted copies. By @stuartparmenter in [#10233](https://github.com/gfx-rs/wgpu/pull/10233).
+
 ### Bug Fixes
 
 #### General
@@ -199,11 +226,15 @@ By @sagudev in [#10109](https://github.com/gfx-rs/wgpu/pull/10109).
 #### naga
 
 - Reject unsigned integer arguments to WGSL `sign()` during Naga validation instead of allowing them to reach and panic in the SPIR-V backend. By @notferdon in [#10451](https://github.com/gfx-rs/wgpu/pull/10451).
+- Declare `LocalInvocationIndex` only once in SPIR-V mesh shader entry points that don't take `local_invocation_index` as an argument. Previously these shaders were invalid SPIR-V. By @apollo-2006 in [#10497](https://github.com/gfx-rs/wgpu/pull/10497).
 - Fix panics when shader `var<immediate>` size is larger than 256 bytes. By @beicause in [#9725](https://github.com/gfx-rs/wgpu/pull/9725).
 - Fix a panic in the SPIR-V frontend when a subgroup collective operation (e.g. `OpGroupNonUniformUMin`) or `OpGroupNonUniformBallot` used an argument whose value needed to be spilled to a temporary variable, such as when the argument was computed inside a loop. By @nazar-pc in [#9957](https://github.com/gfx-rs/wgpu/issues/9957).
 - Lower `@builtin(instance_index)` in `@any_hit` and `@closest_hit` entry points to SPIR-V's `InstanceId` rather than `InstanceIndex`, which Vulkan only permits in the vertex stage. By @JMS55 in [10154](https://github.com/gfx-rs/wgpu/pull/10154).
 - Report WGSL type mismatches in `return` statements, function call arguments and composite constructors as WGSL errors naming both types, instead of IR validation errors that could only name the operands by handle index (such as "The \`return\` expression Some([1]) does not match the declared return type Some([1])"). By @emilk in [#9973](https://github.com/gfx-rs/wgpu/pull/9973).
 - Implement constant evaluation of the `extractBits`, `insertBits`, `faceForward`, `reflect`, and `refract` built-in functions. Evaluates expression at compile time to report issues early like `offset` and `count` selecting bits beyond the width of the data. By @MinerSheep in [#10258](https://github.com/gfx-rs/wgpu/pull/10258).
+- Reject WGSL loads of structs and arrays that contain atomics, which previously caused a panic in the HLSL backend. By @drakeo338 in [#10458](https://github.com/gfx-rs/wgpu/issues/10458).
+- Panic when a SPIR-V's instruction's word count is greater than `u16::MAX`, instead of emitting a malformed instruction. By @ErichDonGubler in [#10537](https://github.com/gfx-rs/wgpu/pull/10537).
+- Accept a `ViewIndex` input declared as a signed integer in the SPIR-V frontend, as glslang and Slang emit it, by reading it as a `u32`. By @VoxelBoy in [#10568](https://github.com/gfx-rs/wgpu/pull/10568).
 
 #### Validation
 
@@ -215,6 +246,7 @@ By @sagudev in [#10109](https://github.com/gfx-rs/wgpu/pull/10109).
 - Numeric types must now match exactly on inter-stage interfaces. Previously, the receiving type was only required to be a subtype of the originating type. By @andyleiserson in [#9999](https://github.com/gfx-rs/wgpu/pull/9999).
 - Relaxed requirement that the pipeline scalar type for a color output be at least as wide as the shader output type. Now, only the scalar kind must match. By @andyleiserson in [#9999](https://github.com/gfx-rs/wgpu/pull/9999).
 - Disallow array types in `var<immediate>`. By @beicause in [#10081](https://github.com/gfx-rs/wgpu/pull/10081).
+- Mesh shader draws in a multiview render pass now require the highest view in the multiview mask to be less than `Limits::max_mesh_multiview_view_count`. Previously one view past the limit was accepted. By @apollo-2006 in [#10496](https://github.com/gfx-rs/wgpu/pull/10496).
 
 #### Naga
 
@@ -226,6 +258,7 @@ By @sagudev in [#10109](https://github.com/gfx-rs/wgpu/pull/10109).
 - Correctly emit primitive_index for the SPIR-V backend, handling mesh and raytracing shaders. Before, you could not use primitive_index with these shader types. An enable primitive_index statement is still required in wgsl shaders, in addition to enable wgpu_mesh_shader/enable wgpu_ray_tracing_pipeline. By @JMS55 in [#10153](https://github.com/gfx-rs/wgpu/pull/10153).
 - Prevent invalid IR from being generated when using a ray query in a loop. By @Vecvec in [#9945](https://github.com/gfx-rs/wgpu/pull/9945)
 - Raise a type error, rather than panic, for some cases of an invalid `select` argument type in WGSL constant evaluation. By @ErichDonGubler in [#10350](https://github.com/gfx-rs/wgpu/pull/10350).
+- Fix `sign` returning unexpected values for floating-point arguments in the HLSL backend. By @ErichDonGubler in [#10434](https://github.com/gfx-rs/wgpu/pull/10434).
 
 #### DX12
 
@@ -242,6 +275,9 @@ By @sagudev in [#10109](https://github.com/gfx-rs/wgpu/pull/10109).
 - Request `VK_KHR_spirv_1_4` and raise the generated SPIR-V version to 1.4 when `EXPERIMENTAL_RAY_TRACING_PIPELINES` or `EXPERIMENTAL_MESH_SHADER` is enabled on a pre-Vulkan-1.2 device. Both `SPV_KHR_ray_tracing` and `SPV_EXT_mesh_shader` require SPIR-V 1.4, but shaders were generated as 1.3 there: ray tracing pipelines requested neither the extension nor the version, and mesh shaders requested the extension without raising the version. Naga now rejects ray tracing pipeline shaders targeting below SPIR-V 1.4, as it already did for mesh shaders. By @JMS55 in [#10193](https://github.com/gfx-rs/wgpu/pull/10193).
 - Fix feature detection for [Robust Image Access](https://docs.vulkan.org/spec/latest/chapters/shaders.html#shaders-robust-image-access) when `VK_EXT_robustness2` is present but reports no support for [Robust Image Access 2](https://docs.vulkan.org/spec/latest/chapters/shaders.html#shaders-robust-image-access2), fixing a shader compilation crash on some Mali drivers. By @raphlinus in [#10291](https://github.com/gfx-rs/wgpu/pull/10291).
 - Fixed a panic on the Vulkan backend when dropping a surface whose acquired texture was still alive (e.g. after `present` failed due to a lost device). By @MarcelStruckWO in [#10230](https://github.com/gfx-rs/wgpu/pull/10230).
+- Don't use timeline semaphores on VeriSilicon's proprietary driver, as on NXP's i.MX 8 SoCs, which crashes in `vkQueueSubmit` with them. wgpu falls back to binary fences there. By @tronical in [#10535](https://github.com/gfx-rs/wgpu/pull/10535).
+- Recover from `VK_ERROR_FRAGMENTED_POOL` and `VK_ERROR_OUT_OF_POOL_MEMORY` when allocating descriptor sets by resetting or retiring the offending pool and retrying on the next available (or a freshly created) pool instead of panicking. By @beicause in [#10264](https://github.com/gfx-rs/wgpu/pull/10264).
+- Enable the `depthBiasClamp` device feature when it is supported. Pipelines with a non-zero `DepthBiasState::clamp` previously failed Vulkan validation. By @VoxelBoy in [#10566](https://github.com/gfx-rs/wgpu/pull/10566).
 
 #### Metal
 
@@ -470,7 +506,7 @@ By @inner-daemons in [#9434](https://github.com/gfx-rs/wgpu/pull/9434).
 #### Vulkan
 
 - Add `vulkan::Queue::add_wait_semaphore` and `vulkan::Queue::remove_wait_semaphore`. Lets external producers (CUDA / OpenCL / D3D12 imported via `VK_KHR_external_semaphore_*`) be waited on at the next `Queue::submit` call without a CPU block. By @AdrianEddy in [#9461](https://github.com/gfx-rs/wgpu/pull/9461).
-- Add `vulkan::Device::texture_from_dmabuf_fd()` for importing DMA-buf textures on Linux, with `VULKAN_EXTERNAL_MEMORY_FD` and `VULKAN_EXTERNAL_MEMORY_DMA_BUF` feature flags. By @TODO in [#9412](https://github.com/gfx-rs/wgpu/pull/9412).
+- Add `vulkan::Device::texture_from_dmabuf_fd()` for importing DMA-buf textures on Linux, with `VULKAN_EXTERNAL_MEMORY_FD` and `VULKAN_EXTERNAL_MEMORY_DMA_BUF` feature flags. By @countgitmick in [#9366](https://github.com/gfx-rs/wgpu/pull/9366).
 - Add support for `RawWindowHandle::Drm` on Unix, conditional on the `drm` feature.
   - DRM support by @rectalogic in [#9182](https://github.com/gfx-rs/wgpu/pull/9182).
   - Conditional compilation by @jimblandy in [#9390](https://github.com/gfx-rs/wgpu/pull/9390)

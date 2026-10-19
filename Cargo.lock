@@ -1659,9 +1659,9 @@ dependencies = [
 
 [[package]]
 name = "glam"
-version = "0.33.11"
+version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35b4e837a1d133645d1dcf283e146a4b9901e390a1c13545f959cfed3a72f24f"
+checksum = "eece6af6447501f08d55ff4f6aed8a2753e4224e51899bccf3d5ae3d2de564b1"
 dependencies = [
  "bytemuck",
  "encase",
@@ -2481,7 +2481,6 @@ dependencies = [
  "naga",
  "ron",
  "serde",
- "serde_json",
  "spirv",
  "toml",
 ]
@@ -2491,12 +2490,12 @@ name = "naga-types"
 version = "30.0.0"
 dependencies = [
  "arbitrary",
+ "bytemuck",
  "hashbrown 0.17.1",
  "indexmap",
  "rustc-hash 1.1.0",
  "serde",
  "strum 0.28.0",
- "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4931,6 +4930,7 @@ version = "30.0.0"
 dependencies = [
  "raw-window-handle",
  "serde",
+ "static_assertions",
  "wgpu-core",
  "wgpu-core-remote-types",
  "wgpu-hal",
