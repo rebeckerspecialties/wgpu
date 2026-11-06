@@ -8,8 +8,8 @@ use crate::{
     back::{
         self,
         msl::{
-            writer::{TypeContext, TypedGlobalVariable},
-            BackendResult, EntryPointArgument, Error, NAMESPACE, WRAPPED_ARRAY_FIELD,
+            writer::TypeContext, BackendResult, EntryPointArgument, Error, NAMESPACE,
+            WRAPPED_ARRAY_FIELD,
         },
     },
     proc::NameKey,
@@ -217,21 +217,7 @@ impl<W: core::fmt::Write> super::Writer<W> {
         writeln!(self.out, ") {{")?;
 
         // Function body
-        for (handle, var) in module.global_variables.iter() {
-            if var.space != crate::AddressSpace::WorkGroup || fun_info[handle].is_empty() {
-                continue;
-            }
-            let tyvar = TypedGlobalVariable {
-                module,
-                names: &self.names,
-                handle,
-                usage: crate::valid::GlobalUse::WRITE | crate::valid::GlobalUse::READ,
-                reference: false,
-            };
-            write!(self.out, "{}", back::INDENT)?;
-            tyvar.try_fmt(&mut self.out)?;
-            writeln!(self.out, ";")?;
-        }
+        self.write_workgroup_variable_declarations(module, fun_info)?;
         write!(self.out, "{indent}")?;
         let result_name = if ep.stage == crate::ShaderStage::Task {
             let name = self.namer.call("nagaGridSize");

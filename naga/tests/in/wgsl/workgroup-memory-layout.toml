@@ -1,0 +1,29 @@
+targets = "METAL"
+
+[pipeline_constants]
+N = 513
+W = 64
+
+[msl]
+fake_missing_bindings = false
+lang_version = [3, 2]
+spirv_cross_compatibility = false
+zero_initialize_workgroup_memory = true
+
+[msl.per_entry_point_map.main]
+sizes_buffer = 1
+resources = [
+    { bind_target = { buffer = 0, mutable = true }, resource_binding = { group = 0, binding = 0 } },
+]
+
+[msl.per_entry_point_map.no_shared]
+sizes_buffer = 1
+resources = [
+    { bind_target = { buffer = 0, mutable = true }, resource_binding = { group = 0, binding = 0 } },
+]
+
+[msl.per_entry_point_map.padded_only]
+sizes_buffer = 1
+resources = [
+    { bind_target = { buffer = 0, mutable = true }, resource_binding = { group = 0, binding = 0 } },
+]

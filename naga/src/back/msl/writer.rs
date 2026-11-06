@@ -1039,6 +1039,59 @@ impl<W: Write> Writer<W> {
         self.out
     }
 
+    pub(super) fn write_workgroup_variable_declarations(
+        &mut self,
+        module: &crate::Module,
+        fun_info: &valid::FunctionInfo,
+    ) -> BackendResult {
+        let variables: Vec<_> = module
+            .global_variables
+            .iter()
+            .filter(|&(handle, var)| {
+                var.space == crate::AddressSpace::WorkGroup && !fun_info[handle].is_empty()
+            })
+            .collect();
+        if variables.is_empty() {
+            return Ok(());
+        }
+
+        // One allocation avoids an A10X compiler crash with mixed workgroup types.
+        let type_name = self.namer.call("nagaWorkgroupMemoryType");
+        let memory_name = self.namer.call("nagaWorkgroupMemory");
+        writeln!(self.out, "{}struct {type_name} {{", back::INDENT)?;
+        for &(handle, var) in &variables {
+            let ty = TypeContext {
+                handle: var.ty,
+                gctx: module.to_ctx(),
+                names: &self.names,
+                access: crate::StorageAccess::empty(),
+                first_time: false,
+            };
+            let name = &self.names[&NameKey::GlobalVariable(handle)];
+            writeln!(self.out, "{}{ty} {name};", back::Level(2))?;
+        }
+        writeln!(self.out, "{}}};", back::INDENT)?;
+        writeln!(
+            self.out,
+            "{}threadgroup {type_name} {memory_name};",
+            back::INDENT
+        )?;
+        for &(handle, _) in &variables {
+            let tyvar = TypedGlobalVariable {
+                module,
+                names: &self.names,
+                handle,
+                usage: fun_info[handle],
+                reference: true,
+            };
+            write!(self.out, "{}", back::INDENT)?;
+            tyvar.try_fmt(&mut self.out)?;
+            let name = &self.names[&NameKey::GlobalVariable(handle)];
+            writeln!(self.out, " = {memory_name}.{name};")?;
+        }
+        Ok(())
+    }
+
     /// Generates statements to be inserted immediately before and at the very
     /// start of the body of each loop, to defeat MSL infinite loop reasoning.
     /// The 0th item of the returned tuple should be inserted immediately prior
@@ -8320,6 +8373,9 @@ template <typename A>
 
             // Metal doesn't support private mutable variables outside of functions,
             // so we put them here, just like the locals.
+            if !is_wrapped {
+                self.write_workgroup_variable_declarations(module, fun_info)?;
+            }
             for (handle, var) in module.global_variables.iter() {
                 let usage = fun_info[handle];
                 if usage.is_empty() {
@@ -8351,22 +8407,6 @@ template <typename A>
                             writeln!(self.out, " = {{}};")?;
                         }
                     };
-                } else if var.space == crate::AddressSpace::WorkGroup {
-                    // Workgroup variables are declared as function variables but can
-                    // only be declared in the entry point. So we receive them as an
-                    // input reference here.
-                    if !is_wrapped {
-                        let tyvar = TypedGlobalVariable {
-                            module,
-                            names: &self.names,
-                            handle,
-                            usage,
-                            reference: false,
-                        };
-                        write!(self.out, "{}", back::INDENT)?;
-                        tyvar.try_fmt(&mut self.out)?;
-                        writeln!(self.out, ";")?;
-                    }
                 } else if let Some(ref binding) = var.binding {
                     let resolved = options.resolve_resource_binding(ep, binding).unwrap();
                     if let Some(sampler) = resolved.as_inline_sampler(options) {
