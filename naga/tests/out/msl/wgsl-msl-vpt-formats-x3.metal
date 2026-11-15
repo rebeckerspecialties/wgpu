@@ -123,13 +123,13 @@ metal::float4 unpackUnorm16x4_(metal::ushort b0, metal::ushort b1, metal::ushort
     return metal::float4(float(b1 << 8 | b0) / 65535.0f, float(b3 << 8 | b2) / 65535.0f, float(b5 << 8 | b4) / 65535.0f, float(b7 << 8 | b6) / 65535.0f);
 }
 float unpackSnorm16_(metal::ushort b0, metal::ushort b1) {
-    return metal::unpack_snorm2x16_to_float(b1 << 8 | b0).x;
+    return metal::max(float(as_type<short>(metal::ushort(b1 << 8 | b0))) / 32767.0f, -1.0f);
 }
 metal::float2 unpackSnorm16x2_(uint b0, uint b1, uint b2, uint b3) {
-    return metal::unpack_snorm2x16_to_float(b3 << 24 | b2 << 16 | b1 << 8 | b0);
+    return metal::max(metal::float2(as_type<short>(metal::ushort(b1 << 8 | b0)), as_type<short>(metal::ushort(b3 << 8 | b2))) / 32767.0f, -1.0f);
 }
 metal::float4 unpackSnorm16x4_(uint b0, uint b1, uint b2, uint b3, uint b4, uint b5, uint b6, uint b7) {
-    return metal::float4(metal::unpack_snorm2x16_to_float(b3 << 24 | b2 << 16 | b1 << 8 | b0), metal::unpack_snorm2x16_to_float(b7 << 24 | b6 << 16 | b5 << 8 | b4));
+    return metal::max(metal::float4(as_type<short>(metal::ushort(b1 << 8 | b0)), as_type<short>(metal::ushort(b3 << 8 | b2)), as_type<short>(metal::ushort(b5 << 8 | b4)), as_type<short>(metal::ushort(b7 << 8 | b6))) / 32767.0f, -1.0f);
 }
 float unpackFloat16_(metal::ushort b0, metal::ushort b1) {
     return float(as_type<half>(metal::ushort(b1 << 8 | b0)));

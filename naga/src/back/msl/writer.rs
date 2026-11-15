@@ -5684,6 +5684,8 @@ template <typename A>
                 Ok((name, 8, Some(VectorSize::Quad), Scalar::F32))
             }
             Snorm16 => {
+                // Keep normalization explicit, as for the other integer formats.
+                // The Metal unpack intrinsic spills for vertex inputs on A12.
                 let name = self.namer.call("unpackSnorm16");
                 writeln!(
                     self.out,
@@ -5692,7 +5694,7 @@ template <typename A>
                 )?;
                 writeln!(
                     self.out,
-                    "{}return metal::unpack_snorm2x16_to_float(b1 << 8 | b0).x;",
+                    "{}return metal::max(float(as_type<short>(metal::ushort(b1 << 8 | b0))) / 32767.0f, -1.0f);",
                     back::INDENT
                 )?;
                 writeln!(self.out, "}}")?;
@@ -5709,7 +5711,8 @@ template <typename A>
                 )?;
                 writeln!(
                     self.out,
-                    "{}return metal::unpack_snorm2x16_to_float(b3 << 24 | b2 << 16 | b1 << 8 | b0);",
+                    "{}return metal::max(metal::float2(as_type<short>(metal::ushort(b1 << 8 | b0)), \
+                                            as_type<short>(metal::ushort(b3 << 8 | b2))) / 32767.0f, -1.0f);",
                     back::INDENT
                 )?;
                 writeln!(self.out, "}}")?;
@@ -5730,8 +5733,10 @@ template <typename A>
                 )?;
                 writeln!(
                     self.out,
-                    "{}return metal::float4(metal::unpack_snorm2x16_to_float(b3 << 24 | b2 << 16 | b1 << 8 | b0), \
-                                            metal::unpack_snorm2x16_to_float(b7 << 24 | b6 << 16 | b5 << 8 | b4));",
+                    "{}return metal::max(metal::float4(as_type<short>(metal::ushort(b1 << 8 | b0)), \
+                                            as_type<short>(metal::ushort(b3 << 8 | b2)), \
+                                            as_type<short>(metal::ushort(b5 << 8 | b4)), \
+                                            as_type<short>(metal::ushort(b7 << 8 | b6))) / 32767.0f, -1.0f);",
                     back::INDENT
                 )?;
                 writeln!(self.out, "}}")?;
