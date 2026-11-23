@@ -786,6 +786,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
         let mut vk_clear_values =
             ArrayVec::<vk::ClearValue, { super::MAX_TOTAL_ATTACHMENTS }>::new();
         let mut rp_key = super::RenderPassKey {
+            density: false,
             colors: ArrayVec::default(),
             depth_stencil: None,
             sample_count: desc.sample_count,
@@ -849,6 +850,17 @@ impl crate::CommandEncoder for super::CommandEncoder {
             fb_key.push_view(ds.target.view.identified_raw_view());
         }
 
+        let density = desc.color_attachments.iter().flatten().find_map(|cat| {
+            cat.target
+                .view
+                .density
+                .or_else(|| cat.resolve_target.as_ref().and_then(|at| at.view.density))
+        });
+        if let Some(view) = density {
+            fb_key.push_view(view);
+        }
+        self.density_pass = density.is_some();
+        rp_key.density = self.density_pass;
         let render_area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: vk::Extent2D {
@@ -988,7 +1000,11 @@ impl crate::CommandEncoder for super::CommandEncoder {
             self.device.raw.cmd_bind_pipeline(
                 self.active,
                 vk::PipelineBindPoint::GRAPHICS,
-                pipeline.raw,
+                if self.density_pass {
+                    pipeline.density.expect("density-compatible pipeline")
+                } else {
+                    pipeline.raw
+                },
             )
         };
     }

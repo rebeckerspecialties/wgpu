@@ -53,7 +53,7 @@ use semaphore_list::SemaphoreList;
 
 use crate::vulkan::semaphore_list::{SemaphoreListMode, SemaphoreType};
 
-const MAX_TOTAL_ATTACHMENTS: usize = crate::MAX_COLOR_ATTACHMENTS * 2 + 1;
+const MAX_TOTAL_ATTACHMENTS: usize = crate::MAX_COLOR_ATTACHMENTS * 2 + 2;
 
 #[derive(Clone, Debug)]
 pub struct Api;
@@ -496,6 +496,7 @@ struct DepthStencilAttachmentKey {
 
 #[derive(Clone, Eq, Default, Hash, PartialEq)]
 struct RenderPassKey {
+    density: bool,
     colors: ArrayVec<Option<ColorAttachmentKey>, { crate::MAX_COLOR_ATTACHMENTS }>,
     depth_stencil: Option<DepthStencilAttachmentKey>,
     sample_count: u32,
@@ -503,6 +504,7 @@ struct RenderPassKey {
 }
 
 struct DeviceShared {
+    density_pipelines: core::sync::atomic::AtomicBool,
     raw: ash::Device,
     family_index: u32,
     queue_index: u32,
@@ -815,6 +817,7 @@ pub enum TextureMemory {
 
 #[derive(Debug)]
 pub struct Texture {
+    density_image: core::sync::atomic::AtomicU64,
     raw: vk::Image,
     memory: TextureMemory,
     format: wgt::TextureFormat,
@@ -829,6 +832,18 @@ pub struct Texture {
 impl crate::DynTexture for Texture {}
 
 impl Texture {
+    /// Associate an external R8G8_UNORM density image before creating views.
+    ///
+    /// # Safety
+    /// The caller enabled fragmentDensityMapNonSubsampledImages and guarantees
+    /// the image has the compatible extent/layers, remains in
+    /// FRAGMENT_DENSITY_MAP_OPTIMAL_EXT, and outlives all uses of this texture.
+    pub unsafe fn set_fragment_density_image(&self, image: vk::Image) {
+        use ash::vk::Handle;
+        self.density_image
+            .store(image.as_raw(), core::sync::atomic::Ordering::Release);
+    }
+
     /// # Safety
     ///
     /// - The image handle must not be manually destroyed
@@ -847,6 +862,7 @@ impl Texture {
 
 #[derive(Debug)]
 pub struct TextureView {
+    density: Option<IdentifiedTextureView>,
     raw_texture: vk::Image,
     raw: vk::ImageView,
     _layers: NonZeroU32,
@@ -1024,7 +1040,7 @@ impl FramebufferKey {
 }
 
 /// A texture view paired with its identity.
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 struct IdentifiedTextureView {
     raw: vk::ImageView,
     identity: ResourceIdentity<vk::ImageView>,
@@ -1086,6 +1102,7 @@ pub struct CommandEncoder {
     counters: Arc<wgt::HalCounters>,
 
     current_pipeline_is_multiview: bool,
+    density_pass: bool,
 }
 
 impl Drop for CommandEncoder {
@@ -1156,6 +1173,7 @@ impl crate::DynShaderModule for ShaderModule {}
 
 #[derive(Debug)]
 pub struct RenderPipeline {
+    density: Option<vk::Pipeline>,
     raw: vk::Pipeline,
     is_multiview: bool,
 }

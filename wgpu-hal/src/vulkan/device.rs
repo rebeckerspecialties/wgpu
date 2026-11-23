@@ -81,6 +81,7 @@ impl super::DeviceShared {
             Entry::Occupied(e) => *e.get(),
             Entry::Vacant(e) => {
                 let super::RenderPassKey {
+                    density,
                     ref colors,
                     ref depth_stencil,
                     sample_count,
@@ -203,9 +204,31 @@ impl super::DeviceShared {
                     vk_subpass
                 }];
 
+                let mut density_info = vk::RenderPassFragmentDensityMapCreateInfoEXT::default();
+                if density {
+                    let layout = vk::ImageLayout::FRAGMENT_DENSITY_MAP_OPTIMAL_EXT;
+                    density_info.fragment_density_map_attachment = vk::AttachmentReference {
+                        attachment: vk_attachments.len() as u32,
+                        layout,
+                    };
+                    vk_attachments.push(
+                        vk::AttachmentDescription::default()
+                            .format(vk::Format::R8G8_UNORM)
+                            .samples(vk::SampleCountFlags::TYPE_1)
+                            .load_op(vk::AttachmentLoadOp::LOAD)
+                            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                            .initial_layout(layout)
+                            .final_layout(layout),
+                    );
+                }
                 let mut vk_info = vk::RenderPassCreateInfo::default()
                     .attachments(&vk_attachments)
                     .subpasses(&vk_subpasses);
+                if density {
+                    vk_info = vk_info.push_next(&mut density_info);
+                }
 
                 let mut multiview_info;
                 let mask;
@@ -285,6 +308,15 @@ impl MemoryProperties {
 
 impl super::Device {
     /// # Safety
+    /// Call before creating pipelines, and only after enabling both fragment
+    /// density map and non-subsampled images on the underlying VkDevice.
+    pub unsafe fn enable_fragment_density_pipelines(&self) {
+        self.shared
+            .density_pipelines
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// # Safety
     ///
     /// - `vk_image` must be created respecting `desc`
     /// - If `drop_callback` is [`None`], wgpu-hal will take ownership of `vk_image`. If
@@ -308,6 +340,7 @@ impl super::Device {
         }
 
         super::Texture {
+            density_image: Default::default(),
             raw: vk_image,
             drop_guard,
             memory,
@@ -1287,9 +1320,39 @@ impl crate::Device for super::Device {
 
         let identity = self.shared.texture_view_identity_factory.next();
 
+        let image = texture
+            .density_image
+            .load(core::sync::atomic::Ordering::Acquire);
+        let density = if image != 0 && desc.usage.contains(wgt::TextureUses::COLOR_TARGET) {
+            use ash::vk::Handle;
+            let info = vk::ImageViewCreateInfo::default()
+                .image(vk::Image::from_raw(image))
+                .format(vk::Format::R8G8_UNORM)
+                .view_type(if layers.get() == 1 {
+                    vk::ImageViewType::TYPE_2D
+                } else {
+                    vk::ImageViewType::TYPE_2D_ARRAY
+                })
+                .subresource_range(subresource_range);
+            match unsafe { self.shared.raw.create_image_view(&info, None) } {
+                Ok(handle) => Some(super::IdentifiedTextureView {
+                    raw: handle,
+                    identity: self.shared.texture_view_identity_factory.next(),
+                }),
+                Err(e) => {
+                    unsafe {
+                        self.shared.raw.destroy_image_view(raw, None);
+                    }
+                    return Err(super::map_host_device_oom_and_ioca_err(e));
+                }
+            }
+        } else {
+            None
+        };
         self.counters.texture_views.add(1);
 
         Ok(super::TextureView {
+            density,
             raw_texture: texture.raw,
             raw,
             _layers: layers,
@@ -1302,6 +1365,9 @@ impl crate::Device for super::Device {
         })
     }
     unsafe fn destroy_texture_view(&self, view: super::TextureView) {
+        if let Some(density) = view.density {
+            unsafe { self.shared.raw.destroy_image_view(density.raw, None) };
+        }
         unsafe { self.shared.raw.destroy_image_view(view.raw, None) };
 
         self.counters.texture_views.sub(1);
@@ -1400,6 +1466,7 @@ impl crate::Device for super::Device {
             temp_texture_views: Default::default(),
             counters: Arc::clone(&self.counters),
             current_pipeline_is_multiview: false,
+            density_pass: false,
         })
     }
 
@@ -2144,9 +2211,21 @@ impl crate::Device for super::Device {
         let vk_dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
+        let density_pass = if self
+            .shared
+            .density_pipelines
+            .load(core::sync::atomic::Ordering::Acquire)
+            && !compatible_rp_key.colors.is_empty()
+        {
+            let mut key = compatible_rp_key.clone();
+            key.density = true;
+            Some(self.shared.make_render_pass(key)?)
+        } else {
+            None
+        };
         let raw_pass = self.shared.make_render_pass(compatible_rp_key)?;
 
-        let vk_infos = [{
+        let info = {
             vk::GraphicsPipelineCreateInfo::default()
                 .layout(desc.layout.raw)
                 .stages(&stages)
@@ -2159,7 +2238,12 @@ impl crate::Device for super::Device {
                 .color_blend_state(&vk_color_blend)
                 .dynamic_state(&vk_dynamic_state)
                 .render_pass(raw_pass)
-        }];
+        };
+        let mut vk_infos = ArrayVec::<_, 2>::new();
+        vk_infos.push(info);
+        if let Some(pass) = density_pass {
+            vk_infos.push(info.render_pass(pass));
+        }
 
         let pipeline_cache = desc
             .cache
@@ -2172,10 +2256,16 @@ impl crate::Device for super::Device {
                 self.shared
                     .raw
                     .create_graphics_pipelines(pipeline_cache, &vk_infos, None)
-                    .map_err(|(_, e)| super::map_pipeline_err(e))
+                    .map_err(|(partial, e)| {
+                        for p in partial {
+                            self.shared.raw.destroy_pipeline(p, None);
+                        }
+                        super::map_pipeline_err(e)
+                    })
             }?
         };
 
+        let density = density_pass.map(|_| raw_vec.pop().unwrap());
         let raw = raw_vec.pop().unwrap();
         if let Some(label) = desc.label {
             unsafe { self.shared.set_object_name(raw, label) };
@@ -2213,12 +2303,16 @@ impl crate::Device for super::Device {
         self.counters.render_pipelines.add(1);
 
         Ok(super::RenderPipeline {
+            density,
             raw,
             is_multiview: desc.multiview_mask.is_some(),
         })
     }
 
     unsafe fn destroy_render_pipeline(&self, pipeline: super::RenderPipeline) {
+        if let Some(p) = pipeline.density {
+            unsafe { self.shared.raw.destroy_pipeline(p, None) };
+        }
         unsafe { self.shared.raw.destroy_pipeline(pipeline.raw, None) };
 
         self.counters.render_pipelines.sub(1);
