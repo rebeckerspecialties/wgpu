@@ -817,6 +817,9 @@ pub enum TextureMemory {
 
 #[derive(Debug)]
 pub struct Texture {
+    #[cfg(not(target_has_atomic = "64"))]
+    density_image: Mutex<vk::Image>,
+    #[cfg(target_has_atomic = "64")]
     density_image: core::sync::atomic::AtomicU64,
     raw: vk::Image,
     memory: TextureMemory,
@@ -839,9 +842,31 @@ impl Texture {
     /// the image has the compatible extent/layers, remains in
     /// FRAGMENT_DENSITY_MAP_OPTIMAL_EXT, and outlives all uses of this texture.
     pub unsafe fn set_fragment_density_image(&self, image: vk::Image) {
-        use ash::vk::Handle;
-        self.density_image
-            .store(image.as_raw(), core::sync::atomic::Ordering::Release);
+        #[cfg(not(target_has_atomic = "64"))]
+        {
+            *self.density_image.lock() = image;
+        }
+        #[cfg(target_has_atomic = "64")]
+        {
+            use ash::vk::Handle;
+            self.density_image
+                .store(image.as_raw(), core::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn fragment_density_image(&self) -> vk::Image {
+        #[cfg(not(target_has_atomic = "64"))]
+        {
+            *self.density_image.lock()
+        }
+        #[cfg(target_has_atomic = "64")]
+        {
+            use ash::vk::Handle;
+            vk::Image::from_raw(
+                self.density_image
+                    .load(core::sync::atomic::Ordering::Acquire),
+            )
+        }
     }
 
     /// # Safety

@@ -1320,35 +1320,33 @@ impl crate::Device for super::Device {
 
         let identity = self.shared.texture_view_identity_factory.next();
 
-        let image = texture
-            .density_image
-            .load(core::sync::atomic::Ordering::Acquire);
-        let density = if image != 0 && desc.usage.contains(wgt::TextureUses::COLOR_TARGET) {
-            use ash::vk::Handle;
-            let info = vk::ImageViewCreateInfo::default()
-                .image(vk::Image::from_raw(image))
-                .format(vk::Format::R8G8_UNORM)
-                .view_type(if layers.get() == 1 {
-                    vk::ImageViewType::TYPE_2D
-                } else {
-                    vk::ImageViewType::TYPE_2D_ARRAY
-                })
-                .subresource_range(subresource_range);
-            match unsafe { self.shared.raw.create_image_view(&info, None) } {
-                Ok(handle) => Some(super::IdentifiedTextureView {
-                    raw: handle,
-                    identity: self.shared.texture_view_identity_factory.next(),
-                }),
-                Err(e) => {
-                    unsafe {
-                        self.shared.raw.destroy_image_view(raw, None);
+        let image = texture.fragment_density_image();
+        let density =
+            if image != vk::Image::null() && desc.usage.contains(wgt::TextureUses::COLOR_TARGET) {
+                let info = vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .format(vk::Format::R8G8_UNORM)
+                    .view_type(if layers.get() == 1 {
+                        vk::ImageViewType::TYPE_2D
+                    } else {
+                        vk::ImageViewType::TYPE_2D_ARRAY
+                    })
+                    .subresource_range(subresource_range);
+                match unsafe { self.shared.raw.create_image_view(&info, None) } {
+                    Ok(handle) => Some(super::IdentifiedTextureView {
+                        raw: handle,
+                        identity: self.shared.texture_view_identity_factory.next(),
+                    }),
+                    Err(e) => {
+                        unsafe {
+                            self.shared.raw.destroy_image_view(raw, None);
+                        }
+                        return Err(super::map_host_device_oom_and_ioca_err(e));
                     }
-                    return Err(super::map_host_device_oom_and_ioca_err(e));
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         self.counters.texture_views.add(1);
 
         Ok(super::TextureView {
