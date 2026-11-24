@@ -73,3 +73,13 @@ All changes are expected to pass CI. The commands below are useful local checks,
 ## Changelog
 
 We maintain a changelog in CHANGELOG.md. Changes should be noted in the changelog if they are user-visible (changes to documented public APIs, significant bug fixes, or new functionality). We generally do not consider changes to wgpu-core, wgpu-hal, wgpu-core-remote, or wgpu-core-remote-types worthy of changelogs, unless a `wgpu` user is expected to interface with them directly. Changelog descriptions should be concise. If you are not sure whether something should be in the CHANGELOG or you are not sure how to describe the change, ask the user for guidance.
+
+<!-- quest-qualification-handoff -->
+## Runtime qualification
+
+Apple Metal signed-normalized vertex conversion and register pressure are separate from Quest's Vulkan results.
+
+Start with the [shared runtime handoff](https://github.com/rebeckerspecialties/BabylonNative/blob/wgpu/Documentation/QuestRuntimeHandoff.md) for artifact pins and related PRs. For Apple performance comparisons, hold the camera path, resolution, AO, brightness and thermal state fixed; no per-call probes. Separate JS CPU, GPU time and display pacing.
+
+- Implementation: Preserve format semantics and retest regenerated Metal output and controls before upstreaming.
+- Device: Check matching pixels and actual register pressure at matched thermals on the XS and iPhone 12.
