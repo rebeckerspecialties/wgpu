@@ -530,6 +530,7 @@ impl Swapchain for NativeSwapchain {
         let texture = crate::vulkan::SurfaceTexture {
             index,
             texture: crate::vulkan::Texture {
+                density_image: Default::default(),
                 raw: self.images[index as usize],
                 drop_guard: None,
                 memory: crate::vulkan::TextureMemory::External,

@@ -2903,6 +2903,7 @@ impl super::Adapter {
         };
 
         let shared = Arc::new(super::DeviceShared {
+            density_pipelines: Default::default(),
             raw: raw_device,
             family_index,
             queue_index,

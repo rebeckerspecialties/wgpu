@@ -196,3 +196,13 @@ When implementing WGSL built-in functions:
 2. **Check parameterization**: The spec lists exactly which type combinations are valid
 3. **Don't assume types**: For bitcast, only `i32`, `u32`, `f32` are specified - not 64-bit types
 4. **AbstractInt special cases**: Some operations have special handling for abstract integers
+
+<!-- quest-qualification-handoff -->
+## Quest runtime qualification
+
+Vulkan fragment-density attachments: preserve ordinary render targets and target-handle portability.
+
+Start with the [shared Quest handoff](https://github.com/rebeckerspecialties/BabylonNative/blob/wgpu/Documentation/QuestRuntimeHandoff.md) for verified artifact pins, the camera ownership audit, and links to related PRs. Use normal logging, confirm both eyes on the physical display, and verify Home passthrough before and after a single test. Do not use compositor submission count as visual evidence or trigger hosted simulator screenshots for this handoff.
+
+- Implementation: Keep attachment lifetime, feature fallback and targets without atomic u64 covered; do not assume every adapter accepts density images.
+- Device: Compare peripheral/center raster in both eyes at off/max/off and rerun a non-density Vulkan control.
