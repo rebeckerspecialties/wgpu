@@ -121,9 +121,16 @@ impl crate::CommandEncoder for super::CommandEncoder {
 
     unsafe fn begin_encoding(&mut self, label: crate::Label) -> Result<(), crate::DeviceError> {
         if self.free.is_empty() {
+            // Most encoders return to the pool after recording only one or two buffers.
+            // Grow in batches once an encoder actually needs more.
+            let count = if self.free.capacity() == 0 {
+                2
+            } else {
+                ALLOCATION_GRANULARITY
+            };
             let vk_info = vk::CommandBufferAllocateInfo::default()
                 .command_pool(self.raw)
-                .command_buffer_count(ALLOCATION_GRANULARITY);
+                .command_buffer_count(count);
             let cmd_buf_vec = unsafe {
                 self.device
                     .raw

@@ -12,7 +12,53 @@ pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
         DROP_ENCODER_AFTER_ERROR,
         ENCODER_OPERATIONS_FAIL_WHILE_PASS_ALIVE,
     ]);
+    #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "freebsd"
+    ))]
+    vec.push(VULKAN_COMMAND_POOL_REUSE);
 }
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "freebsd"
+))]
+#[apply(gpu_test!)]
+static VULKAN_COMMAND_POOL_REUSE: GpuTestConfiguration = GpuTestConfiguration::new()
+    .parameters(TestParameters::default().skip(FailureCase::backend(
+        wgpu::Backends::all() - wgpu::Backends::VULKAN,
+    )))
+    .run_sync(|ctx| {
+        use wgpu::hal::{self, CommandEncoder as _, Device as _};
+        // SAFETY: no raw command buffer is submitted. Return every finished buffer
+        // to its original, closed encoder before resetting it.
+        unsafe {
+            let device = ctx.device.as_hal::<hal::vulkan::Api>().unwrap();
+            let queue = ctx.queue.as_hal::<hal::vulkan::Api>().unwrap();
+            let mut encoder = device
+                .create_command_encoder(&hal::CommandEncoderDescriptor {
+                    label: Some("pool growth and reuse"),
+                    queue: &*queue,
+                })
+                .unwrap();
+            for count in [0, 1, 2, 3, 18, 19, 48, 1, 0] {
+                let mut finished = Vec::new();
+                for _ in 0..count {
+                    encoder.begin_encoding(None).unwrap();
+                    finished.push(encoder.end_encoding().unwrap());
+                }
+                encoder.begin_encoding(None).unwrap();
+                encoder.discard_encoding();
+                encoder.reset_all(finished.into_iter());
+            }
+        }
+    });
 
 #[apply(gpu_test!)]
 static DROP_ENCODER: GpuTestConfiguration = GpuTestConfiguration::new()
