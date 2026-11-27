@@ -242,8 +242,10 @@ impl super::Device {
 
                 let options = MTLCompileOptions::new();
                 options.setLanguageVersion(self.shared.private_caps.msl_version);
-                options.setMathMode(MTLMathMode::Safe);
-                options.setMathFloatingPointFunctions(MTLMathFloatingPointFunctions::Precise);
+                if available!(macos = 15.0, ios = 18.0, tvos = 18.0, visionos = 2.0) {
+                    options.setMathMode(MTLMathMode::Safe);
+                    options.setMathFloatingPointFunctions(MTLMathFloatingPointFunctions::Precise);
+                }
 
                 // https://developer.apple.com/documentation/metal/mtlcompileoptions/preserveinvariance
                 if available!(macos = 11.0, ios = 13.0, tvos = 14.0, visionos = 1.0) {
